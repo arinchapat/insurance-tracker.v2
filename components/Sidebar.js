@@ -3,6 +3,7 @@
 import Link from 'next/link'
 import { usePathname } from 'next/navigation'
 import { Icons } from './ui/Icons'
+import LogoutButton from './LogoutButton' // <-- นำเข้าปุ่ม Logout ที่นี่
 
 const NAV_ITEMS = [
   { section: 'เมนูหลัก' },
@@ -101,10 +102,13 @@ export default function Sidebar() {
         borderTop: '1px solid rgba(255,255,255,.06)',
         fontSize: 11.5, color: '#64748b', lineHeight: 1.6,
       }}>
-        <div style={{ color: '#94a3b8', fontWeight: 600, marginBottom: 4 }}>รอบบิลถัดไป</div>
-        ชับบ์ · CHB-A8821 · 25 เม.ย. 2026<br />
-        เหลือ <b style={{ color: '#f59e0b' }}>7 วัน</b> · 14 รายการ
+        
+        {/* แสดงปุ่ม Logout ตรงนี้ */}
+        <div style={{ marginTop: 16 }}>
+          <LogoutButton />
+        </div>
       </div>
+      
     </aside>
   )
 }

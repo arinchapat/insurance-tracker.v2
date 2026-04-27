@@ -2,820 +2,902 @@
 // app/(app)/remit/page.js
 // กระเป๋าขวา — วางบิล / โอนเบี้ยให้บริษัท
 
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useMemo } from 'react'
 import { createClient } from '@/lib/supabase/client'
 import { Icons, fmtB, fmtDate } from '@/components/ui/Icons'
 
-// ─── Helpers ────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// LOGIC (ห้ามแตะ)
+// ─────────────────────────────────────────────────────────────────────────────
 
-/** policy_start + credit_days → วันกำหนดส่ง (per-policy, ไม่ใช่ fixed date) */
-function calcRemitDeadline(policyStart, creditDays) {
+// กลุ่ม 1: เริ่มคุ้มครอง 1–15  → ตัดรอบ 15
+//   credit 15 → EOM เดือนนั้น | credit 30 → 15 เดือนถัดไป | credit 60 → 15 เดือน+2
+// กลุ่ม 2: เริ่มคุ้มครอง 16–EOM → ตัดรอบ EOM
+//   credit 15 → 15 เดือนถัดไป | credit 30 → EOM เดือนถัดไป | credit 60 → EOM เดือน+2
+
+function eom(year, month) { return new Date(year, month + 1, 0) }
+
+function calcDeadlineInfo(policyStart, creditDays) {
   if (!policyStart || creditDays == null) return null
-  const d = new Date(policyStart)
-  d.setDate(d.getDate() + Number(creditDays))
-  return d
+  const s = new Date(policyStart)
+  const d = s.getDate(), y = s.getFullYear(), m = s.getMonth()
+  if (d >= 1 && d <= 15) {
+    const cutoffDate = new Date(y, m, 15)
+    const remitDeadline = creditDays === 15 ? eom(y, m)
+      : creditDays === 30 ? new Date(y, m + 1, 15)
+      : creditDays === 60 ? new Date(y, m + 2, 15) : null
+    return { cutoffDate, remitDeadline, group: 1 }
+  } else {
+    const cutoffDate = eom(y, m)
+    const remitDeadline = creditDays === 15 ? new Date(y, m + 1, 15)
+      : creditDays === 30 ? eom(y, m + 1)
+      : creditDays === 60 ? eom(y, m + 2) : null
+    return { cutoffDate, remitDeadline, group: 2 }
+  }
 }
 
-function daysDiff(from, to) {
-  return Math.ceil((new Date(to) - new Date(from)) / 86400000)
+function todayMidnight() { const d = new Date(); d.setHours(0,0,0,0); return d }
+function daysDiff(target) { return Math.ceil((target - todayMidnight()) / 86400000) }
+
+function fmtThShort(d) {
+  if (!d) return '—'
+  return new Date(d).toLocaleDateString('th-TH', { day:'numeric', month:'short', year:'2-digit' })
+}
+function fmtThLong(d) {
+  if (!d) return '—'
+  return new Date(d).toLocaleDateString('th-TH', { day:'numeric', month:'long', year:'numeric' })
 }
 
-/** CSV escape + BOM สำหรับ Excel ภาษาไทย */
+function makeCycleKey(policyStart, group) {
+  const s = new Date(policyStart)
+  return `${s.getFullYear()}-${String(s.getMonth()+1).padStart(2,'0')}-${group}`
+}
+function makeCycleLabel(policyStart, group, remitDeadline) {
+  const s = new Date(policyStart)
+  const eomDay = eom(s.getFullYear(), s.getMonth()).getDate()
+  const period = group === 1 ? '1–15' : `16–${eomDay}`
+  const month  = s.toLocaleDateString('th-TH', { month:'short', year:'2-digit' })
+  return `รอบ ${period} ${month} → ดิว ${fmtThShort(remitDeadline)}`
+}
+
 function csvEsc(v) {
   const s = String(v ?? '')
-  return s.includes(',') || s.includes('"') || s.includes('\n')
-    ? `"${s.replace(/"/g, '""')}"`
-    : s
+  return s.includes(',') || s.includes('"') || s.includes('\n') ? `"${s.replace(/"/g,'""')}"` : s
 }
-
 function downloadCSV(filename, rows) {
-  const csv = rows.map(r => r.map(csvEsc).join(',')).join('\r\n')
-  const blob = new Blob(['\uFEFF' + csv], { type: 'text/csv;charset=utf-8;' })
+  const csv  = rows.map(r => r.map(csvEsc).join(',')).join('\r\n')
+  const blob = new Blob(['\uFEFF' + csv], { type:'text/csv;charset=utf-8;' })
   const url  = URL.createObjectURL(blob)
   const a    = document.createElement('a')
   a.href = url; a.download = filename; a.click()
   setTimeout(() => URL.revokeObjectURL(url), 2000)
 }
+function todayStr() { return new Date().toISOString().slice(0,10) }
+function xlLink(url, label='ดูสลิป') { return url ? `=HYPERLINK("${url}","${label}")` : '' }
 
-function todayStr() {
-  return new Date().toISOString().slice(0, 10)
-}
-
-// ─── Enrichment ─────────────────────────────────────────────────────────────
-
-/**
- * รับ policy row จาก Supabase + credit_days ของ agent_code
- * คืน object พร้อม computed fields ทั้งหมด
- */
 function enrichPolicy(policy, creditDays) {
   const allInsts  = policy.installments ?? []
   const paidInsts = allInsts.filter(i => i.paid_at != null)
   const paidCount = paidInsts.length
   const totalInst = allInsts.length
-
-  // ยอดที่เก็บได้จริง
-  const totalPaid = paidInsts.reduce((s, i) => s + Number(i.paid_amount ?? 0), 0)
-
-  // เงื่อนไข whitelist: จ่ายเต็ม หรือ จ่ายแล้ว ≥ 2 งวด
+  const netPremium = Number(policy.premium ?? 0)
   const isFullPay  = policy.pay_mode === 'full'
-                  || (totalInst > 0 && paidCount >= totalInst)
   const isEligible = isFullPay || paidCount >= 2
-
-  // วันกำหนดส่ง = policy_start + credit_days (ไม่ใช่ fixed date)
-  const remitDeadline = calcRemitDeadline(policy.policy_start, creditDays)
-
-  const today     = new Date()
-  today.setHours(0, 0, 0, 0)
-  const isOverdue = remitDeadline ? today >= remitDeadline : false
-  const daysLeft  = remitDeadline ? daysDiff(today, remitDeadline) : null
-
-  // เคส Risk: ถึงกำหนดแล้ว แต่ลูกค้ายังไม่ผ่านเงื่อนไข
-  const isRisk = isOverdue && !isEligible
-
-  // Safety locks
-  const payModeLower = (policy.pay_mode ?? '').toLowerCase()
-  const coverageLower = (policy.coverage_type ?? '').toLowerCase()
-  const isCreditCard  = payModeLower.includes('credit') || payModeLower.includes('บัตร')
-  const isTravel      = coverageLower.includes('travel') || coverageLower.includes('เดินทาง')
-
-  // Credit card: เตือนถ้าครบกำหนดวันนี้
-  const todayDate = new Date(); todayDate.setHours(0,0,0,0)
-  const deadlineDate = remitDeadline ? new Date(remitDeadline) : null
-  if (deadlineDate) deadlineDate.setHours(0,0,0,0)
-  const ccWarningToday = isCreditCard && deadlineDate &&
-    deadlineDate.getTime() === todayDate.getTime()
-
-  // Travel lock: ห้ามจ่ายจนกว่าจะถึงกำหนด
-  const travelLocked = isTravel && !isOverdue
-
-  return {
-    ...policy,
-    paidInsts,
-    paidCount,
-    totalInst,
-    totalPaid,
-    isFullPay,
-    isEligible,
-    remitDeadline,
-    isOverdue,
-    daysLeft,
-    isRisk,
-    isCreditCard,
-    isTravel,
-    ccWarningToday,
-    travelLocked,
-  }
+  const info = calcDeadlineInfo(policy.policy_start, creditDays)
+  const cutoffDate    = info?.cutoffDate    ?? null
+  const remitDeadline = info?.remitDeadline ?? null
+  const group         = info?.group         ?? null
+  const today      = todayMidnight()
+  const deadlineMs = remitDeadline ? new Date(remitDeadline).setHours(0,0,0,0) : null
+  const isOverdue  = deadlineMs != null && today.getTime() > deadlineMs
+  const isDueToday = deadlineMs != null && today.getTime() === deadlineMs
+  const isDue      = isOverdue || isDueToday
+  const daysLeft   = remitDeadline ? daysDiff(remitDeadline) : null
+  const isRisk     = isDue && !isEligible
+  const isCreditCard   = (policy.pay_mode ?? '').toLowerCase().includes('credit')
+  const ccWarningToday = isCreditCard && isDueToday
+  const isTravel       = (policy.coverage_type ?? '').toLowerCase().includes('travel')
+  const travelLocked   = isTravel && !isDue
+  const cycleKey   = policy.policy_start && group ? makeCycleKey(policy.policy_start, group) : 'unknown'
+  const cycleLabel = policy.policy_start && group ? makeCycleLabel(policy.policy_start, group, remitDeadline) : 'ไม่ระบุรอบ'
+  const slipUrls   = paidInsts.sort((a,b) => a.installment_no - b.installment_no).map(i => ({ no:i.installment_no, url:i.slip_url ?? '' }))
+  const clientStatus = isFullPay ? 'ชำระเต็มจำนวน' : paidCount === 0 ? 'ยังไม่ชำระ' : `ผ่อน ${paidCount}/${totalInst} งวด`
+  return { ...policy, paidInsts, paidCount, totalInst, netPremium, isFullPay, isEligible, cutoffDate, remitDeadline, group, isOverdue, isDueToday, isDue, daysLeft, isRisk, isCreditCard, ccWarningToday, isTravel, travelLocked, cycleKey, cycleLabel, slipUrls, clientStatus }
 }
 
-// ─── Main Component ──────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// MAIN PAGE
+// ─────────────────────────────────────────────────────────────────────────────
 
 export default function RemitPage() {
   const supabase = createClient()
-  const [agentCodes, setAgentCodes] = useState([])
-  const [selected,   setSelected]   = useState(null)
-  const [policies,   setPolicies]   = useState([])
-  const [loading,    setLoading]    = useState(true)
-  const [loadingPol, setLoadingPol] = useState(false)
-  const [tab,        setTab]        = useState('ready')
+  const [agentCodes,    setAgentCodes]    = useState([])
+  const [selected,      setSelected]      = useState(null)
+  const [allPolicies,   setAllPolicies]   = useState([])
+  const [loading,       setLoading]       = useState(true)
+  const [loadingPol,    setLoadingPol]    = useState(false)
+  const [tab,           setTab]           = useState('ready')
+  const [selectedCycle, setSelectedCycle] = useState('all')
+  const [checkedIds,    setCheckedIds]    = useState(new Set())
 
   useEffect(() => { loadCodes() }, [])
-  useEffect(() => { if (selected) loadPolicies(selected) }, [selected])
+  useEffect(() => { if (selected) { loadPolicies(selected); setCheckedIds(new Set()); setSelectedCycle('all') } }, [selected])
+  useEffect(() => { setCheckedIds(new Set()) }, [selectedCycle, tab])
 
-  // ── Load agent codes ────────────────────────────────────────────────────
   async function loadCodes() {
     setLoading(true)
     const { data: { user } } = await supabase.auth.getUser()
-    const { data } = await supabase
-      .from('agent_codes')
-      .select('*, companies(name, color)')
-      .eq('user_id', user.id)
-      .eq('is_active', true)
-      .order('code')
-
+    const { data } = await supabase.from('agent_codes').select('*, companies(name, color)').eq('user_id', user.id).eq('is_active', true).order('code')
     setAgentCodes(data ?? [])
     if (data?.length) setSelected(data[0])
     setLoading(false)
   }
 
-  // ── Load policies (1 กรมธรรม์ = 1 แถว) ─────────────────────────────────
-  // ดึงจาก policies แล้วฝัง installments เข้ามา ไม่แยกแถวตามงวด
   async function loadPolicies(ac) {
     setLoadingPol(true)
     const { data: { user } } = await supabase.auth.getUser()
-
-    const { data, error } = await supabase
-      .from('policies')
-      .select(`
-        id, policy_start, policy_end, premium, pay_mode, coverage_type,
-        plate, model, policy_status,
-        customers(name),
-        installments(id, installment_no, paid_amount, amount_due, paid_at, due_date)
-      `)
-      .eq('agent_code', ac.code)
-      .eq('user_id', user.id)
-      .neq('policy_status', 'cancelled')
-      .order('policy_start', { ascending: false })
-
+    const { data, error } = await supabase.from('policies').select(`id, policy_start, policy_end, premium, pay_mode, coverage_type, plate, model, policy_status, customers(name), installments(id, installment_no, total_inst, amount_due, paid_at, paid_amount, slip_url, due_date)`).eq('agent_code', ac.code).eq('user_id', user.id).in('policy_status', ['active', 'reinstated']).order('policy_start', { ascending: false })
     if (error) console.error('loadPolicies:', error)
-
-    const enriched = (data ?? []).map(p => enrichPolicy(p, ac.credit_days ?? 15))
-    setPolicies(enriched)
+    setAllPolicies((data ?? []).map(p => enrichPolicy(p, ac.credit_days ?? 15)))
     setLoadingPol(false)
   }
 
-  // ── Tab data ────────────────────────────────────────────────────────────
-  // ✅ พร้อมนำส่ง: ผ่านเงื่อนไข + ถึงกำหนดแล้ว
-  const ready = policies.filter(p => p.isEligible && p.isOverdue)
-  // ⚠️ ต้องตัดสินใจ: ถึงกำหนดแล้ว แต่ยังไม่ผ่านเงื่อนไข
-  const risk  = policies.filter(p => p.isRisk)
-  // 📝 ตรวจสอบบิล: ทั้งหมด (รวมที่ยังไม่ถึงกำหนด)
-  const all   = policies
+  const billingCycles = useMemo(() => {
+    const map = new Map()
+    allPolicies.forEach(p => { if (!map.has(p.cycleKey)) map.set(p.cycleKey, { key:p.cycleKey, label:p.cycleLabel }) })
+    return Array.from(map.values()).sort((a,b) => a.key.localeCompare(b.key))
+  }, [allPolicies])
 
-  const displayed = tab === 'ready' ? ready
-                  : tab === 'risk'  ? risk
-                  : all
+  const cyclePolicies = useMemo(() => selectedCycle === 'all' ? allPolicies : allPolicies.filter(p => p.cycleKey === selectedCycle), [allPolicies, selectedCycle])
 
-  const totalReady = ready.reduce((s, p) => s + p.totalPaid, 0)
-  const totalRisk  = risk.reduce((s, p) => s + p.totalPaid, 0)
-  const totalDisp  = displayed.reduce((s, p) => s + p.totalPaid, 0)
+  const ready    = cyclePolicies.filter(p => p.isDue && p.isEligible)
+  const risk     = cyclePolicies.filter(p => p.isRisk)
+  const reconAll = cyclePolicies
+  const displayed = tab === 'ready' ? ready : tab === 'risk' ? risk : reconAll
 
-  // ── Safety alerts (global scan) ─────────────────────────────────────────
-  const ccToday    = policies.filter(p => p.ccWarningToday)
-  const travelLock = policies.filter(p => p.travelLocked)
+  const allChecked  = displayed.length > 0 && displayed.every(p => checkedIds.has(p.id))
+  const someChecked = displayed.some(p => checkedIds.has(p.id))
 
-  // ── Export helpers ──────────────────────────────────────────────────────
+  function toggleCheck(id) { setCheckedIds(prev => { const n = new Set(prev); n.has(id) ? n.delete(id) : n.add(id); return n }) }
+  function toggleAll() {
+    if (allChecked) { setCheckedIds(prev => { const n = new Set(prev); displayed.forEach(p => n.delete(p.id)); return n }) }
+    else            { setCheckedIds(prev => { const n = new Set(prev); displayed.forEach(p => n.add(p.id));    return n }) }
+  }
 
-  /**
-   * Format 1 — Remittance Advice
-   * สำหรับโอนก้อนใหญ่ให้บริษัท แนบสลิป 1 ใบ
-   */
+  const checkedPolicies = cyclePolicies.filter(p => checkedIds.has(p.id))
+  const sumReady = checkedPolicies.filter(p =>  p.isEligible).reduce((s,p) => s + p.netPremium, 0)
+  const sumRisk  = checkedPolicies.filter(p => !p.isEligible).reduce((s,p) => s + p.netPremium, 0)
+  const sumTotal = checkedPolicies.reduce((s,p) => s + p.netPremium, 0)
+  const cntReady = checkedPolicies.filter(p =>  p.isEligible).length
+  const cntRisk  = checkedPolicies.filter(p => !p.isEligible).length
+
+  const ccToday     = cyclePolicies.filter(p => p.ccWarningToday)
+  const travelLocks = cyclePolicies.filter(p => p.travelLocked)
+
+  function exportRows() { return checkedIds.size > 0 ? checkedPolicies : displayed }
+  function exportNote() { const n = exportRows().length; return checkedIds.size > 0 ? `${n} รายการที่เลือก` : `${n} รายการทั้งหมด` }
+
   function exportRemittanceAdvice() {
-    const rows = [
+    const rows = exportRows(); const total = rows.reduce((s,p) => s + p.netPremium, 0)
+    downloadCSV(`remittance_advice_${selected?.code}_${todayStr()}.csv`, [
       ['📑 รายงานนำส่งเบี้ยประกัน (Remittance Advice)'],
       ['รหัสตัวแทน:', selected?.code ?? '', 'บริษัท:', selected?.companies?.name ?? ''],
-      ['วันที่ Export:', new Date().toLocaleDateString('th-TH', { dateStyle:'long' })],
-      ['เครดิตส่งเงิน:', `${selected?.credit_days ?? 15} วัน หลังวันเริ่มคุ้มครอง`],
-      [],
-      [
-        'เลขกรมธรรม์', 'ชื่อลูกค้า', 'ประเภทประกัน', 'วิธีชำระ',
-        'วันเริ่มคุ้มครอง', 'วันกำหนดส่ง',
-        'งวดที่จ่ายแล้ว', 'งวดทั้งหมด', 'สถานะ',
-        'ยอดนำส่งสุทธิ (บาท)',
-      ],
-      ...ready.map(p => [
-        p.id,
-        p.customers?.name ?? '',
-        p.coverage_type ?? '',
-        p.pay_mode ?? '',
-        p.policy_start
-          ? new Date(p.policy_start).toLocaleDateString('th-TH')
-          : '',
-        p.remitDeadline
-          ? p.remitDeadline.toLocaleDateString('th-TH')
-          : '',
-        p.paidCount,
-        p.totalInst,
-        p.isFullPay ? 'จ่ายเต็ม' : `ผ่อน ${p.paidCount} งวด`,
-        p.totalPaid,
-      ]),
-      [],
-      ['', '', '', '', '', '', '', '', 'รวมทั้งหมด', totalReady],
-      ['', '', '', '', '', '', '', '', 'จำนวนกรมธรรม์', ready.length],
-      [],
-      ['หมายเหตุ:', 'โอนก้อนเดียว', 'แนบ:', 'สลิปโอนเงิน 1 ใบ'],
-    ]
-    downloadCSV(`remittance_${selected?.code}_${todayStr()}.csv`, rows)
+      ['วันที่ออกรายงาน:', new Date().toLocaleDateString('th-TH', { dateStyle:'long' })],
+      ['เครดิตส่งเงิน:', `${selected?.credit_days ?? 15} วัน`], [],
+      ['เลขกรมธรรม์','ชื่อลูกค้า','ประเภทประกัน','วิธีชำระ','วันเริ่มคุ้มครอง','กลุ่มรอบบิล','วันตัดรอบ','กำหนดส่งเงิน','สถานะฝั่งลูกค้า','ยอดเต็ม (Net Premium)'],
+      ...rows.map(p => [p.id, p.customers?.name??'', p.coverage_type??'', p.pay_mode??'', fmtThShort(p.policy_start), p.group===1?'กลุ่ม 1 (1–15)':'กลุ่ม 2 (16–สิ้นเดือน)', fmtThShort(p.cutoffDate), fmtThShort(p.remitDeadline), p.clientStatus, p.netPremium]),
+      [], ['','','','','','','','','รวมยอดนำส่ง', total], ['','','','','','','','','จำนวนกรมธรรม์', rows.length],
+      [], ['📌 แนบไปกับ:', 'สลิปโอนเงิน 1 ใบ (โอนรวมก้อนเดียว)'],
+    ])
   }
 
-  /**
-   * Format 2 — แจ้งงานด่วน (ลูกค้าโอนตรงบริษัท)
-   * ไม่มีเงินผ่านมือเรา แค่ส่งหลักฐานให้บริษัทตัดหนี้
-   * แนะนำ: zip สลิป 1 โฟลเดอร์ / 1 กรมธรรม์
-   */
   function exportDirectPayNotification() {
-    const rows = [
+    const rows = exportRows(); const maxSlips = rows.reduce((m,p) => Math.max(m, p.slipUrls.length), 0)
+    const slipHdrs = Array.from({ length: maxSlips }, (_,i) => `สลิปงวด ${i+1}`)
+    downloadCSV(`direct_notify_${selected?.code}_${todayStr()}.csv`, [
       ['📑 รายการแจ้งงานด่วน — ลูกค้าโอนตรงบริษัท'],
-      ['รหัสตัวแทน:', selected?.code ?? '', 'บริษัท:', selected?.companies?.name ?? ''],
-      ['วันที่:', new Date().toLocaleDateString('th-TH', { dateStyle:'long' })],
-      [],
-      ['⚠️ วิธีจัดสลิป:', '1 โฟลเดอร์ต่อ 1 กรมธรรม์ (ชื่อโฟลเดอร์ = เลขกรมธรรม์)', 'รวมสลิปทุกงวดไว้ข้างใน', 'ZIP แล้วส่งพร้อมไฟล์นี้'],
-      [],
-      [
-        'เลขกรมธรรม์', 'ชื่อลูกค้า', 'ประเภทประกัน',
-        'ยอดรวม (บาท)', 'งวดที่ชำระ', 'วันที่ชำระล่าสุด',
-        'ชื่อโฟลเดอร์สลิป', 'หมายเหตุ',
-      ],
-      ...ready.map(p => {
-        const lastPaid = p.paidInsts
-          .filter(i => i.paid_at)
-          .sort((a, b) => new Date(b.paid_at) - new Date(a.paid_at))[0]
-        const instNos = p.paidInsts
-          .sort((a, b) => a.installment_no - b.installment_no)
-          .map(i => `งวด ${i.installment_no}`)
-          .join(', ')
-        return [
-          p.id,
-          p.customers?.name ?? '',
-          p.coverage_type ?? '',
-          p.totalPaid,
-          instNos,
-          lastPaid?.paid_at
-            ? new Date(lastPaid.paid_at).toLocaleDateString('th-TH')
-            : '',
-          p.id,   // ชื่อโฟลเดอร์ = เลขกรมธรรม์
-          p.isFullPay ? 'จ่ายเต็ม — ปลอดภัย 100%' : `ผ่อน ${p.paidCount}/${p.totalInst} งวด`,
-        ]
-      }),
-      [],
-      ['', '', '', totalReady, '', '', '', `รวม ${ready.length} กรมธรรม์`],
-    ]
-    downloadCSV(`direct_notify_${selected?.code}_${todayStr()}.csv`, rows)
+      ['รหัสตัวแทน:', selected?.code??'', 'บริษัท:', selected?.companies?.name??''],
+      ['วันที่:', new Date().toLocaleDateString('th-TH', { dateStyle:'long' })], [],
+      ['📁 วิธีจัดสลิป:', 'ตั้งชื่อโฟลเดอร์ = เลขกรมธรรม์ → รวมสลิปทุกงวดไว้ข้างใน → ZIP แล้วส่งพร้อมไฟล์นี้'], [],
+      ['เลขกรมธรรม์','ชื่อลูกค้า','ประเภท','วันเริ่มคุ้มครอง','กำหนดส่งบริษัท','สถานะฝั่งลูกค้า','ยอดเต็ม (Net Premium)','โฟลเดอร์สลิป',...slipHdrs],
+      ...rows.map(p => [p.id, p.customers?.name??'', p.coverage_type??'', fmtThShort(p.policy_start), fmtThShort(p.remitDeadline), p.clientStatus, p.netPremium, p.id, ...slipHdrs.map((_,i) => { const s=p.slipUrls[i]; return s?.url ? xlLink(s.url, `สลิปงวด ${s.no}`) : '' })]),
+      [], ['','','','','','รวม', rows.reduce((s,p) => s+p.netPremium,0), `${rows.length} กรมธรรม์`],
+      [], ['📌 หมายเหตุ:', 'เงินถึงบริษัทแล้ว — หน้าที่เราแค่ส่งหลักฐานให้บริษัทตัดหนี้'],
+    ])
   }
 
-  /**
-   * Format 3 — กระทบยอดภายใน (Internal Reconciliation)
-   * Raw data ครบ สำหรับ VLOOKUP เทียบ Statement จากบริษัท
-   */
   function exportReconciliation() {
-    const rows = [
+    const rows = exportRows()
+    downloadCSV(`reconciliation_${selected?.code}_${todayStr()}.csv`, [
       ['📑 ข้อมูลกระทบยอดภายใน (Internal Reconciliation)'],
-      ['รหัสตัวแทน:', selected?.code ?? '', 'บริษัท:', selected?.companies?.name ?? ''],
+      ['รหัสตัวแทน:', selected?.code??'', 'บริษัท:', selected?.companies?.name??''],
       ['วันที่ Export:', new Date().toLocaleDateString('th-TH', { dateStyle:'long' })],
-      ['วิธีใช้:', 'นำไป VLOOKUP เทียบ Statement ที่บริษัทส่งมาสิ้นเดือน'],
-      [],
-      [
-        'เลขกรมธรรม์', 'ชื่อลูกค้า', 'ประเภท', 'วิธีชำระ',
-        'วันเริ่มคุ้มครอง', 'วันสิ้นสุด', 'กำหนดส่งเงิน',
-        'เบี้ยรวม (บาท)', 'ยอดเก็บได้ (บาท)',
-        'งวดที่จ่าย', 'งวดทั้งหมด', 'ผ่านเงื่อนไข',
-        'สถานะกรมธรรม์', 'สถานะความเสี่ยง',
-        'หมายเหตุ',
-      ],
-      ...all.map(p => {
-        const status = p.isRisk
-          ? '⚠️ เสี่ยง/ต้องสำรองเงิน'
-          : (p.isEligible && p.isOverdue)
-            ? '✅ พร้อมนำส่ง'
-            : p.isEligible
-              ? '🕐 รอถึงกำหนด'
-              : '🔴 ยังไม่ผ่านเงื่อนไข'
-        const flags = [
-          p.isCreditCard ? '💳 บัตรเครดิต' : '',
-          p.isTravel     ? '✈️ Travel' : '',
-          p.travelLocked ? '🔒 ล็อคไว้' : '',
-        ].filter(Boolean).join(' | ')
-
-        return [
-          p.id,
-          p.customers?.name ?? '',
-          p.coverage_type ?? '',
-          p.pay_mode ?? '',
-          p.policy_start ? new Date(p.policy_start).toLocaleDateString('th-TH') : '',
-          p.policy_end   ? new Date(p.policy_end).toLocaleDateString('th-TH')   : '',
-          p.remitDeadline ? p.remitDeadline.toLocaleDateString('th-TH') : '',
-          p.premium ?? '',
-          p.totalPaid,
-          p.paidCount,
-          p.totalInst,
-          p.isEligible ? 'ผ่าน' : 'ไม่ผ่าน',
-          p.policy_status ?? '',
-          status,
-          flags,
-        ]
-      }),
-      [],
-      ['', '', '', '', '', '', '',
-        all.reduce((s, p) => s + Number(p.premium ?? 0), 0),
-        all.reduce((s, p) => s + p.totalPaid, 0),
-        '', '', '', '', `รวม ${all.length} กรมธรรม์`, ''],
-    ]
-    downloadCSV(`reconciliation_${selected?.code}_${todayStr()}.csv`, rows)
+      ['วิธีใช้:', 'VLOOKUP ด้วยเลขกรมธรรม์เทียบกับ Statement ที่บริษัทส่งมาสิ้นเดือน'], [],
+      ['เลขกรมธรรม์','ชื่อลูกค้า','ประเภท','วิธีชำระ','วันเริ่มคุ้มครอง','วันสิ้นสุดคุ้มครอง','กลุ่มรอบบิล','วันตัดรอบ','กำหนดส่งเงิน','ยอดเต็ม (Net Premium)','งวดจ่ายแล้ว','งวดทั้งหมด','สถานะฝั่งลูกค้า','ผ่านเงื่อนไขโอน','สถานะกรมธรรม์','สถานะความเสี่ยง'],
+      ...rows.map(p => [p.id, p.customers?.name??'', p.coverage_type??'', p.pay_mode??'', fmtThShort(p.policy_start), fmtThShort(p.policy_end), p.group===1?'กลุ่ม 1 (1–15)':'กลุ่ม 2 (16–สิ้นเดือน)', fmtThShort(p.cutoffDate), fmtThShort(p.remitDeadline), p.netPremium, p.paidCount, p.totalInst, p.clientStatus, p.isEligible?'ผ่าน':'ไม่ผ่าน', p.policy_status??'', p.isRisk?'⚠️ เสี่ยง (ถึงดิวแล้ว ยังไม่ผ่านเงื่อนไข)':p.isDue&&p.isEligible?'✅ พร้อมนำส่ง':p.isEligible?'🕐 รอถึงกำหนด':'🔴 ยังไม่ผ่านเงื่อนไข']),
+      [], ['','','','','','','','','รวม', rows.reduce((s,p) => s+p.netPremium,0),'','','','',`รวม ${rows.length} รายการ`],
+    ])
   }
 
-  // ─── Render ───────────────────────────────────────────────────────────────
-  return (
-    <div>
-      <header style={{
-        display:'flex', alignItems:'center', gap:12,
-        padding:'14px 28px', background:'#fff',
-        borderBottom:'1px solid #e5eaf1',
-        position:'sticky', top:0, zIndex:20,
-      }}>
-        <span style={{ fontSize:13, fontWeight:600 }}>กระเป๋าขวา — วางบิล / นำส่งบริษัท</span>
-      </header>
+  // ── Summary stats สำหรับแสดงใน sidebar ──────────────────────────────────
+  function acSummary(ac) {
+    const ps = allPolicies.filter(p => p.agent_code === ac.code || selected?.code === ac.code)
+    // เมื่อเลือก ac นี้ ดูจาก allPolicies (ตอนนี้เป็น selected)
+    if (selected?.code !== ac.code) return null
+    return { ready: ready.length, risk: risk.length, all: allPolicies.length }
+  }
 
-      <div style={{ padding:'26px 32px' }}>
-        <div className="ph">
+  // ── Footer total (based on selection) ─────────────────────────────────────
+  const footerTotal = someChecked
+    ? checkedPolicies.filter(p => displayed.some(d => d.id === p.id)).reduce((s,p) => s + p.netPremium, 0)
+    : displayed.reduce((s,p) => s + p.netPremium, 0)
+
+  // ─── RENDER ───────────────────────────────────────────────────────────────
+  return (
+    <div style={{ background: '#f8fafc', minHeight: '100vh' }}>
+
+      {/* ── Sticky top bar ────────────────────────────────────────────────── */}
+      <header style={{
+        display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+        padding: '0 28px', height: 52, background: '#fff',
+        borderBottom: '1px solid #e2e8f0', position: 'sticky', top: 0, zIndex: 30,
+        boxShadow: '0 1px 3px rgba(0,0,0,.06)',
+      }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+          <span style={{
+            fontSize: 18, width: 32, height: 32, borderRadius: 8,
+            background: '#dbeafe', display: 'flex', alignItems: 'center', justifyContent: 'center',
+          }}>💼</span>
           <div>
-            <h1>กระเป๋าขวา — วางบิล</h1>
-            <div className="sub">
-              คำนวณวันส่งจาก <b>วันเริ่มคุ้มครอง + เครดิตส่งเงิน</b> ต่อกรมธรรม์ (ไม่ใช่ fixed date)
+            <div style={{ fontSize: 13, fontWeight: 700, color: '#1e293b' }}>
+              กระเป๋าขวา — วางบิล
+            </div>
+            <div style={{ fontSize: 10, color: '#94a3b8', marginTop: -1 }}>
+              ยอดนำส่ง = Net Premium เต็ม · กำหนดส่ง = วันตัดรอบ + เครดิต (Chubb)
             </div>
           </div>
         </div>
+        {selected && !loadingPol && (
+          <div style={{ display: 'flex', gap: 6 }}>
+            <SummaryPill color="#166534" bg="#dcfce7" label="พร้อมส่ง" count={ready.length} />
+            <SummaryPill color="#92400e" bg="#fef3c7" label="ต้องตัดสินใจ" count={risk.length} />
+            <SummaryPill color="#1e40af" bg="#dbeafe" label="ทั้งหมด" count={reconAll.length} />
+          </div>
+        )}
+      </header>
 
-        <div style={{ display:'grid', gridTemplateColumns:'260px 1fr', gap:18 }}>
+      <div style={{ display: 'grid', gridTemplateColumns: '220px 1fr', gap: 0, minHeight: 'calc(100vh - 52px)' }}>
 
-          {/* ── Agent code list ──────────────────────────────────────────── */}
-          <div style={{ display:'flex', flexDirection:'column', gap:8 }}>
-            <div style={{
-              fontSize:11, fontWeight:600, color:'var(--muted)',
-              textTransform:'uppercase', letterSpacing:.8, marginBottom:4,
-            }}>
-              รหัสตัวแทน
-            </div>
-            {loading ? (
-              <div style={{ color:'var(--muted)', fontSize:13 }}>กำลังโหลด...</div>
-            ) : agentCodes.length === 0 ? (
-              <div style={{ color:'var(--muted)', fontSize:13 }}>ไม่มีรหัสตัวแทน</div>
-            ) : agentCodes.map(ac => {
-              const isOn = selected?.code === ac.code
-              return (
-                <button
-                  key={ac.code}
-                  onClick={() => setSelected(ac)}
-                  style={{
-                    display:'flex', alignItems:'center', gap:10,
-                    padding:'12px 14px', borderRadius:10,
-                    cursor:'pointer', textAlign:'left',
-                    border:`1px solid ${isOn ? 'var(--blue-500)' : 'var(--border)'}`,
-                    background: isOn ? 'var(--blue-50)' : '#fff',
-                    transition:'all .15s',
-                  }}
-                >
-                  <span style={{
-                    width:8, height:8, borderRadius:'50%',
-                    background: ac.companies?.color ?? '#64748b',
-                    flexShrink:0,
-                  }} />
-                  <div style={{ flex:1, minWidth:0 }}>
-                    <div style={{ fontSize:12, fontWeight:600, fontFamily:'monospace' }}>
-                      {ac.code}
-                    </div>
-                    <div style={{ fontSize:11, color:'var(--muted)', marginTop:1 }}>
-                      {ac.companies?.name}
-                    </div>
-                    <div style={{ fontSize:10, color:'var(--muted)' }}>
-                      เครดิต {ac.credit_days ?? 15} วัน
-                    </div>
-                  </div>
-                  {isOn && <span style={{ color:'var(--blue-600)', fontSize:14 }}>→</span>}
-                </button>
-              )
-            })}
+        {/* ── Agent code sidebar ─────────────────────────────────────────── */}
+        <aside style={{
+          background: '#fff', borderRight: '1px solid #e2e8f0',
+          padding: '20px 12px', display: 'flex', flexDirection: 'column', gap: 4,
+        }}>
+          <div style={{
+            fontSize: 10, fontWeight: 700, color: '#94a3b8', letterSpacing: 1,
+            textTransform: 'uppercase', padding: '0 6px', marginBottom: 8,
+          }}>
+            รหัสตัวแทน
           </div>
 
-          {/* ── Right panel ───────────────────────────────────────────────── */}
-          <div style={{ display:'flex', flexDirection:'column', gap:14 }}>
-            {!selected ? (
-              <div className="empty">
-                <div className="ei">{Icons.building}</div>
-                เลือกรหัสตัวแทนทางซ้าย
-              </div>
-            ) : loadingPol ? (
-              <div style={{ color:'var(--muted)', fontSize:13, padding:20 }}>
-                กำลังโหลดกรมธรรม์...
-              </div>
-            ) : (
-              <>
-                {/* ── Summary card ──────────────────────────────────────── */}
-                <div className="card" style={{ padding:20 }}>
-                  <div style={{ display:'flex', alignItems:'flex-start', gap:16 }}>
-                    <div style={{ flex:1 }}>
-                      <div style={{ display:'flex', alignItems:'center', gap:8, marginBottom:12 }}>
-                        <span style={{
-                          width:10, height:10, borderRadius:'50%',
-                          background: selected.companies?.color ?? '#64748b',
-                        }} />
-                        <span style={{ fontWeight:700, fontSize:16 }}>{selected.code}</span>
-                        <span style={{ fontSize:12, color:'var(--muted)' }}>
-                          {selected.companies?.name}
-                        </span>
-                      </div>
-                      <div style={{ display:'grid', gridTemplateColumns:'repeat(4,1fr)', gap:10 }}>
-                        <MiniKV
-                          label="เครดิตส่งเงิน"
-                          value={`${selected.credit_days ?? 15} วัน`}
-                          sub="หลังวันเริ่มคุ้มครอง"
-                        />
-                        <MiniKV
-                          label="✅ พร้อมนำส่ง"
-                          value={`${ready.length} กรมธรรม์`}
-                          valueColor="var(--green-700)"
-                        />
-                        <MiniKV
-                          label="⚠️ ต้องตัดสินใจ"
-                          value={`${risk.length} กรมธรรม์`}
-                          valueColor={risk.length > 0 ? 'var(--amber-600)' : undefined}
-                        />
-                        <MiniKV
-                          label="📊 ทั้งหมด"
-                          value={`${all.length} กรมธรรม์`}
-                        />
-                      </div>
-                    </div>
-                    <div style={{ textAlign:'right', flexShrink:0 }}>
-                      <div style={{ fontSize:11, color:'var(--muted)' }}>ยอดพร้อมนำส่ง</div>
-                      <div style={{
-                        fontSize:28, fontWeight:700,
-                        fontFeatureSettings:'"tnum"',
-                        color:'var(--blue-700)',
-                      }}>
-                        {fmtB(totalReady)}
-                      </div>
-                      {risk.length > 0 && (
-                        <div style={{ fontSize:12, color:'#d97706', marginTop:4, fontWeight:600 }}>
-                          ⚠️ ต้องสำรอง {fmtB(totalRisk)}
-                        </div>
-                      )}
-                    </div>
-                  </div>
-                </div>
-
-                {/* ── Safety Alerts ─────────────────────────────────────── */}
-                {ccToday.length > 0 && (
-                  <div
-                    className="alert w"
-                    style={{ background:'#fff7ed', borderColor:'#f97316', borderWidth:2 }}
-                  >
-                    {Icons.alert}
-                    <div>
-                      <b style={{ color:'#c2410c' }}>
-                        ⚠️ ระวัง! บัตรเครดิต — ครบกำหนดโอนวันนี้
-                      </b>
-                      <div style={{ fontSize:12, marginTop:4 }}>
-                        กรมธรรม์{' '}
-                        <b>{ccToday.map(p => p.id).join(', ')}</b>
-                        {' '}ชำระด้วยบัตรเครดิต และครบกำหนดส่งวันนี้
-                        → หากโอนวันนี้จะถูกชาร์จ <b>2%</b> และงดค่าคอม
-                      </div>
-                    </div>
-                  </div>
-                )}
-
-                {travelLock.length > 0 && (
-                  <div className="alert i">
-                    {Icons.shield}
-                    <div>
-                      <b>🔒 Travel Lock</b> — กรมธรรม์ประเภท Travel{' '}
-                      {travelLock.length} รายการ ยังไม่ถึงกำหนดส่ง
-                      <br/>
-                      <span style={{ fontSize:12 }}>
-                        ห้ามโอนก่อนวันกำหนดเด็ดขาด — รอจนถึงวันครบกำหนดของแต่ละกรมธรรม์
-                      </span>
-                    </div>
-                  </div>
-                )}
-
-                {/* ── Export Panel ──────────────────────────────────────── */}
-                <div className="card" style={{ padding:16 }}>
-                  <div style={{ fontSize:13, fontWeight:600, marginBottom:4 }}>
-                    📥 Export ข้อมูลนำส่ง
-                  </div>
-                  <div style={{ fontSize:11, color:'var(--muted)', marginBottom:12 }}>
-                    เลือก format ให้ตรงกับสถานการณ์ที่จะส่ง
-                  </div>
-                  <div style={{ display:'flex', gap:10, flexWrap:'wrap' }}>
-                    <ExportButton
-                      emoji="📑"
-                      label="Remittance Advice"
-                      desc="โอนก้อนใหญ่ + สลิป 1 ใบ"
-                      hint="ลูกค้าโอนผ่านตัวแทน"
-                      color="#1e40af"
-                      onClick={exportRemittanceAdvice}
-                    />
-                    <ExportButton
-                      emoji="📑"
-                      label="แจ้งงานด่วน"
-                      desc="แนบสลิปลูกค้าต่อกรมธรรม์"
-                      hint="ลูกค้าโอนตรงบริษัท"
-                      color="#0369a1"
-                      onClick={exportDirectPayNotification}
-                    />
-                    <ExportButton
-                      emoji="📑"
-                      label="กระทบยอดภายใน"
-                      desc="Raw data ครบ VLOOKUP Statement"
-                      hint="เช็กบิลสิ้นเดือน"
-                      color="#6b21a8"
-                      onClick={exportReconciliation}
-                    />
-                  </div>
+          {loading ? (
+            <div style={{ fontSize: 12, color: '#94a3b8', padding: 8 }}>กำลังโหลด...</div>
+          ) : agentCodes.length === 0 ? (
+            <div style={{ fontSize: 12, color: '#94a3b8', padding: 8 }}>ไม่มีรหัสตัวแทน</div>
+          ) : agentCodes.map(ac => {
+            const isOn = selected?.code === ac.code
+            const dotColor = ac.companies?.color ?? '#64748b'
+            return (
+              <button key={ac.code} onClick={() => setSelected(ac)} style={{
+                display: 'flex', alignItems: 'center', gap: 10,
+                padding: '10px 12px', borderRadius: 10,
+                cursor: 'pointer', textAlign: 'left', width: '100%',
+                border: `1.5px solid ${isOn ? '#3b82f6' : 'transparent'}`,
+                background: isOn ? '#eff6ff' : 'transparent',
+                transition: 'all .12s',
+              }}
+              onMouseOver={e => { if (!isOn) e.currentTarget.style.background = '#f8fafc' }}
+              onMouseOut={e  => { if (!isOn) e.currentTarget.style.background = 'transparent' }}
+              >
+                <span style={{
+                  width: 10, height: 10, borderRadius: '50%', flexShrink: 0,
+                  background: dotColor,
+                  boxShadow: isOn ? `0 0 0 3px ${dotColor}30` : 'none',
+                }} />
+                <div style={{ flex: 1, minWidth: 0 }}>
                   <div style={{
-                    fontSize:11, color:'var(--muted)', marginTop:12,
-                    lineHeight:1.6, borderTop:'1px solid var(--border)', paddingTop:10,
+                    fontSize: 12, fontWeight: 700, fontFamily: 'monospace',
+                    color: isOn ? '#1d4ed8' : '#1e293b',
                   }}>
-                    <b>Format 1:</b> โอนก้อนเดียว + สลิป 1 ใบ &nbsp;·&nbsp;
-                    <b>Format 2:</b> 1 โฟลเดอร์ต่อเลขกรมธรรม์ รวมสลิปทุกงวดไว้ข้างใน → ZIP ส่ง &nbsp;·&nbsp;
-                    <b>Format 3:</b> เทียบ Statement สิ้นเดือน — มีรายการไหนเกิน/ขาด แย้งได้ทันที
+                    {ac.code}
+                  </div>
+                  <div style={{ fontSize: 11, color: '#64748b', marginTop: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                    {ac.companies?.name}
+                  </div>
+                  <div style={{ fontSize: 10, color: '#94a3b8', marginTop: 1 }}>
+                    เครดิต {ac.credit_days ?? 15} วัน
                   </div>
                 </div>
+                {isOn && (
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 3, alignItems: 'flex-end' }}>
+                    <span style={{ fontSize: 10, background: '#dcfce7', color: '#166534', padding: '1px 6px', borderRadius: 4, fontWeight: 600 }}>
+                      {ready.length} ส่งได้
+                    </span>
+                    {risk.length > 0 && (
+                      <span style={{ fontSize: 10, background: '#fef3c7', color: '#92400e', padding: '1px 6px', borderRadius: 4, fontWeight: 600 }}>
+                        {risk.length} เสี่ยง
+                      </span>
+                    )}
+                  </div>
+                )}
+              </button>
+            )
+          })}
+        </aside>
 
-                {/* ── Status Tabs ───────────────────────────────────────── */}
-                <div style={{ display:'flex', gap:6 }}>
-                  {[
-                    { key:'ready', label:'✅ พร้อมนำส่ง', count:ready.length,
-                      activeColor:'#166534', activeBg:'#dcfce7' },
-                    { key:'risk',  label:'⚠️ ต้องตัดสินใจ', count:risk.length,
-                      activeColor:'#92400e', activeBg:'#fef3c7' },
-                    { key:'recon', label:'📝 ตรวจสอบบิล', count:all.length,
-                      activeColor:'#1e40af', activeBg:'#dbeafe' },
-                  ].map(t => (
-                    <button
-                      key={t.key}
-                      onClick={() => setTab(t.key)}
+        {/* ── Main content ──────────────────────────────────────────────────── */}
+        <main style={{ padding: '20px 24px', display: 'flex', flexDirection: 'column', gap: 16 }}>
+
+          {!selected ? (
+            <EmptyState icon="🏢" title="เลือกรหัสตัวแทน" sub="เลือกรหัสตัวแทนทางด้านซ้ายเพื่อดูรายการกรมธรรม์" />
+          ) : loadingPol ? (
+            <EmptyState icon="⏳" title="กำลังโหลดข้อมูล..." sub="" />
+          ) : (
+            <>
+              {/* ── Safety Alerts ──────────────────────────────────────── */}
+              {ccToday.length > 0 && (
+                <AlertBanner color="#c2410c" bg="#fff7ed" border="#f97316">
+                  <b>⚠️ ระวัง! กรมธรรม์บัตรเครดิต — ครบกำหนดส่งวันนี้</b>
+                  <br/>
+                  <span style={{ fontSize: 12 }}>
+                    กรมธรรม์ <b>{ccToday.map(p => p.id).join(', ')}</b>
+                    {' '}ชำระด้วยบัตรเครดิตและครบกำหนดวันนี้
+                    → รูดบัตรวันนี้ถูกชาร์จ <b>2%</b> และ <b>งดค่าคอม</b>
+                    — แนะนำ <b>โอนเงินสดแทน</b>
+                  </span>
+                </AlertBanner>
+              )}
+              {travelLocks.length > 0 && (
+                <AlertBanner color="#1d4ed8" bg="#eff6ff" border="#93c5fd">
+                  <b>🔒 Travel Lock — ยังไม่ถึงกำหนดส่งเงิน ({travelLocks.length} รายการ)</b>
+                  <br/>
+                  <span style={{ fontSize: 12 }}>
+                    ห้ามโอนล่วงหน้าเด็ดขาด — Checkbox ของรายการ Travel ถูก disable ไว้จนกว่าจะถึงวันดิว
+                  </span>
+                </AlertBanner>
+              )}
+
+              {/* ── Toolbar: Cycle Filter + Export ────────────────────── */}
+              <div style={{
+                background: '#fff', borderRadius: 12, border: '1px solid #e2e8f0',
+                padding: '14px 16px',
+              }}>
+                {/* Row 1: Filter + Export buttons */}
+                <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                    <span style={{ fontSize: 12, color: '#64748b', whiteSpace: 'nowrap', fontWeight: 600 }}>
+                      🗂️ รอบวางบิล:
+                    </span>
+                    <select
+                      value={selectedCycle}
+                      onChange={e => setSelectedCycle(e.target.value)}
                       style={{
-                        padding:'8px 18px', borderRadius:8,
-                        cursor:'pointer', fontSize:13, fontWeight:600,
-                        background: tab === t.key ? t.activeBg : '#f1f5f9',
-                        color: tab === t.key ? t.activeColor : 'var(--muted)',
-                        border: tab === t.key ? `1.5px solid ${t.activeColor}` : '1.5px solid transparent',
-                        transition:'all .15s',
+                        fontSize: 12, padding: '7px 12px', borderRadius: 8,
+                        border: '1.5px solid #e2e8f0', background: '#f8fafc',
+                        color: '#1e293b', cursor: 'pointer', minWidth: 280,
+                        fontWeight: 500,
                       }}
                     >
-                      {t.label} ({t.count})
-                    </button>
-                  ))}
-                </div>
-
-                {/* ── Table ─────────────────────────────────────────────── */}
-                <div className="card">
-                  <div className="card-h">
-                    <h3 className="card-t">
-                      {tab === 'ready'
-                        ? 'กรมธรรม์พร้อมนำส่ง — ผ่านเงื่อนไข + ถึงกำหนดแล้ว'
-                        : tab === 'risk'
-                          ? 'ต้องตัดสินใจ — ถึงกำหนดแล้ว แต่ลูกค้ายังไม่ผ่านเงื่อนไข'
-                          : 'ข้อมูลทั้งหมด (สำหรับกระทบยอด)'}
-                    </h3>
-                    <span className="card-s" style={{ marginLeft:'auto' }}>
-                      {displayed.length} กรมธรรม์
-                    </span>
+                      <option value="all">ทั้งหมด ({allPolicies.length} กรมธรรม์)</option>
+                      {billingCycles.map(c => {
+                        const cnt = allPolicies.filter(p => p.cycleKey === c.key).length
+                        return <option key={c.key} value={c.key}>{c.label} ({cnt})</option>
+                      })}
+                    </select>
                   </div>
 
-                  {displayed.length === 0 ? (
-                    <div className="empty">
-                      <div className="ei">{Icons.wallet}</div>
-                      ไม่มีรายการในหมวดนี้
-                    </div>
-                  ) : (
-                    <>
-                      <table className="data">
-                        <thead>
-                          <tr>
-                            <th>กรมธรรม์</th>
-                            <th>ลูกค้า</th>
-                            <th>ประเภท</th>
-                            <th>วิธีชำระ</th>
-                            <th>งวดที่จ่าย</th>
-                            <th>กำหนดส่ง</th>
-                            <th>สถานะ</th>
-                            <th style={{ textAlign:'right' }}>ยอดนำส่ง</th>
-                          </tr>
-                        </thead>
-                        <tbody>
-                          {displayed.map(p => (
-                            <PolicyRow key={p.id} p={p} />
-                          ))}
-                        </tbody>
-                      </table>
+                  <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                    <span style={{ fontSize: 11, color: '#94a3b8' }}>
+                      📥 ดาวน์โหลด ({exportNote()}):
+                    </span>
+                    <ExportCard
+                      icon="📄" label="Remittance Advice"
+                      sub="โอนก้อนเดียว + สลิป 1 ใบ"
+                      color="#1e40af" onClick={exportRemittanceAdvice}
+                    />
+                    <ExportCard
+                      icon="⚡" label="แจ้งงานด่วน"
+                      sub="ลูกค้าโอนตรงบริษัท + สลิป"
+                      color="#0369a1" onClick={exportDirectPayNotification}
+                    />
+                    <ExportCard
+                      icon="🔍" label="กระทบยอด"
+                      sub="VLOOKUP เทียบ Statement"
+                      color="#7c3aed" onClick={exportReconciliation}
+                    />
+                  </div>
+                </div>
 
-                      <div className="card-f" style={{
-                        display:'flex', justifyContent:'space-between', alignItems:'center',
+                {/* Row 2: Format guide */}
+                <div style={{
+                  marginTop: 12, paddingTop: 10, borderTop: '1px dashed #e2e8f0',
+                  display: 'flex', gap: 24, flexWrap: 'wrap',
+                }}>
+                  <FormatGuide n="1" label="Remittance Advice" desc="ยอดรวมทุกกรมธรรม์ แนบสลิปโอนเงิน 1 ใบ" />
+                  <FormatGuide n="2" label="แจ้งงานด่วน + สลิป" desc="มี Hyperlink คลิกดูสลิปต่องวดได้เลย (1 โฟลเดอร์/กรมธรรม์)" />
+                  <FormatGuide n="3" label="กระทบยอด VLOOKUP" desc="Raw Data ทุกฟิลด์ เอาไป VLOOKUP เทียบ Statement ที่บริษัทส่งมาสิ้นเดือน" />
+                </div>
+              </div>
+
+              {/* ── Real-time Dashboard (แสดงเฉพาะตอน check) ─────────── */}
+              {checkedIds.size > 0 && (
+                <div style={{
+                  background: '#fff', borderRadius: 12,
+                  border: '2px solid #3b82f6',
+                  padding: '16px 18px',
+                }}>
+                  <div style={{ fontSize: 12, fontWeight: 700, color: '#1d4ed8', marginBottom: 12 }}>
+                    📊 สรุปยอดจากรายการที่เลือก — {checkedIds.size} กรมธรรม์
+                  </div>
+                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 12 }}>
+                    <DashCard
+                      icon="✅" label="ยอดพร้อมนำส่ง"
+                      sub={`${cntReady} กรมธรรม์ ผ่านเงื่อนไขครบ`}
+                      amount={fmtB(sumReady)}
+                      color="#166534" bg="#f0fdf4" border="#bbf7d0"
+                    />
+                    <DashCard
+                      icon="⚠️" label="ยอดที่ต้องตัดสินใจ"
+                      sub={cntRisk > 0 ? `${cntRisk} กรมธรรม์ ต้องสำรองจ่าย` : 'ไม่มีรายการเสี่ยง'}
+                      amount={fmtB(sumRisk)}
+                      color={cntRisk > 0 ? '#92400e' : '#94a3b8'}
+                      bg={cntRisk > 0 ? '#fffbeb' : '#f8fafc'}
+                      border={cntRisk > 0 ? '#fde68a' : '#e2e8f0'}
+                    />
+                    <DashCard
+                      icon="💰" label="ยอดรวมทั้งสิ้น"
+                      sub={`${checkedIds.size} กรมธรรม์ที่เลือก`}
+                      amount={fmtB(sumTotal)}
+                      color="#1e40af" bg="#eff6ff" border="#bfdbfe"
+                    />
+                  </div>
+                </div>
+              )}
+
+              {/* ── Tabs ────────────────────────────────────────────────── */}
+              <div style={{
+                display: 'flex', gap: 0,
+                background: '#fff', borderRadius: 12, border: '1px solid #e2e8f0',
+                overflow: 'hidden',
+              }}>
+                {[
+                  { key:'ready', emoji:'✅', label:'พร้อมนำส่ง',    count:ready.length,
+                    hint:'ถึงกำหนดแล้ว + เงินลูกค้าครบเงื่อนไข',
+                    activeColor:'#166534', activeBg:'#f0fdf4', activeBorder:'#86efac' },
+                  { key:'risk',  emoji:'⚠️', label:'ต้องตัดสินใจ', count:risk.length,
+                    hint:'ถึงกำหนดแล้ว แต่เงินลูกค้ายังไม่ครบ',
+                    activeColor:'#92400e', activeBg:'#fffbeb', activeBorder:'#fde68a' },
+                  { key:'recon', emoji:'📊', label:'รายการทั้งหมด', count:reconAll.length,
+                    hint:'ดูทุกสถานะ สำหรับกระทบยอด',
+                    activeColor:'#1e40af', activeBg:'#eff6ff', activeBorder:'#bfdbfe' },
+                ].map((t, i) => (
+                  <button key={t.key} onClick={() => setTab(t.key)} style={{
+                    flex: 1, padding: '14px 16px', cursor: 'pointer', textAlign: 'left',
+                    borderRight: i < 2 ? '1px solid #e2e8f0' : 'none',
+                    background: tab === t.key ? t.activeBg : '#fff',
+                    borderBottom: tab === t.key ? `3px solid ${t.activeBorder}` : '3px solid transparent',
+                    transition: 'all .15s', border: 'none',
+                    borderRight: i < 2 ? '1px solid #e2e8f0' : 'none',
+                    borderBottom: tab === t.key ? `3px solid ${t.activeBorder}` : '3px solid transparent',
+                  }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                      <span style={{ fontSize: 16 }}>{t.emoji}</span>
+                      <span style={{
+                        fontSize: 13, fontWeight: 700,
+                        color: tab === t.key ? t.activeColor : '#475569',
                       }}>
-                        <span style={{ fontSize:13, color:'var(--muted)' }}>
-                          {tab === 'ready'
-                            ? `รวมยอดนำส่ง ${ready.length} กรมธรรม์`
-                            : `รวม ${displayed.length} กรมธรรม์`}
-                        </span>
-                        <span style={{
-                          fontSize:18, fontWeight:700,
-                          fontFeatureSettings:'"tnum"',
-                          color:'var(--blue-700)',
-                        }}>
-                          {fmtB(totalDisp)}
-                        </span>
-                      </div>
-                    </>
+                        {t.label}
+                      </span>
+                      <span style={{
+                        marginLeft: 'auto',
+                        fontSize: 13, fontWeight: 700,
+                        background: tab === t.key ? t.activeBorder : '#f1f5f9',
+                        color: tab === t.key ? t.activeColor : '#64748b',
+                        padding: '1px 10px', borderRadius: 20, minWidth: 28, textAlign: 'center',
+                      }}>
+                        {t.count}
+                      </span>
+                    </div>
+                    <div style={{ fontSize: 11, color: '#94a3b8', marginTop: 3, paddingLeft: 24 }}>
+                      {t.hint}
+                    </div>
+                  </button>
+                ))}
+              </div>
+
+              {/* ── Tab hints ────────────────────────────────────────────── */}
+              {tab === 'risk' && risk.length > 0 && (
+                <AlertBanner color="#92400e" bg="#fffbeb" border="#fde68a">
+                  <b>ต้องตัดสินใจ:</b> กรมธรรม์เหล่านี้ถึงกำหนดส่งบริษัทแล้ว
+                  แต่เงินลูกค้ายังไม่ครบเงื่อนไข (ไม่ใช่จ่ายเต็ม และจ่ายน้อยกว่า 2 งวด)
+                  <br/>
+                  <span style={{ fontSize: 12 }}>
+                    → ถ้าจะส่ง: <b>สำรองเงินส่วนตัวก่อน</b>
+                    แล้วรอลูกค้าจ่ายงวด 2 หรือไปกดยกเลิกในห้องฉุกเฉิน
+                  </span>
+                </AlertBanner>
+              )}
+              {tab === 'recon' && (
+                <AlertBanner color="#1d4ed8" bg="#eff6ff" border="#bfdbfe">
+                  <b>วิธีใช้ Format 3 (กระทบยอด):</b>{' '}
+                  Export → เปิด Excel → VLOOKUP ด้วย <b>เลขกรมธรรม์</b> เทียบกับ Statement สิ้นเดือน
+                  <br/>
+                  <span style={{ fontSize: 12 }}>
+                    ถ้ารายการไหน <b>โผล่มาเกิน</b> หรือ <b>หายไป</b>
+                    → แย้งได้ทันที พร้อมวันตัดรอบ วันดิว และยอด Net Premium อ้างอิง
+                  </span>
+                </AlertBanner>
+              )}
+
+              {/* ── Policy Table ─────────────────────────────────────────── */}
+              <div style={{
+                background: '#fff', borderRadius: 12,
+                border: '1px solid #e2e8f0', overflow: 'hidden',
+              }}>
+                {/* Table header bar */}
+                <div style={{
+                  display: 'flex', alignItems: 'center', gap: 12,
+                  padding: '14px 18px', borderBottom: '1px solid #e2e8f0',
+                  background: '#f8fafc',
+                }}>
+                  <div style={{ fontSize: 14, fontWeight: 700, color: '#1e293b' }}>
+                    {tab === 'ready'
+                      ? '✅ กรมธรรม์พร้อมนำส่ง'
+                      : tab === 'risk'
+                        ? '⚠️ กรมธรรม์ที่ต้องตัดสินใจ'
+                        : '📊 รายการทั้งหมด'}
+                  </div>
+                  <div style={{ fontSize: 12, color: '#94a3b8' }}>
+                    {tab === 'ready'
+                      ? 'ถึงกำหนดแล้ว + ผ่านเงื่อนไข 2 งวด หรือชำระเต็มจำนวน'
+                      : tab === 'risk'
+                        ? 'ถึงกำหนดแล้ว แต่ยังไม่ผ่านเงื่อนไข'
+                        : 'ทุกสถานะ ใช้ VLOOKUP เทียบ Statement'}
+                  </div>
+                  {someChecked && (
+                    <span style={{
+                      marginLeft: 'auto',
+                      fontSize: 12, fontWeight: 600, color: '#1d4ed8',
+                      background: '#dbeafe', padding: '3px 12px', borderRadius: 20,
+                    }}>
+                      เลือก {checkedIds.size} / {displayed.length} รายการ
+                    </span>
+                  )}
+                  {!someChecked && (
+                    <span style={{ marginLeft: 'auto', fontSize: 12, color: '#94a3b8' }}>
+                      {displayed.length} รายการ
+                    </span>
                   )}
                 </div>
 
-                {/* ── Tab-specific hints ─────────────────────────────────── */}
-                {tab === 'risk' && risk.length > 0 && (
-                  <div className="alert w">
-                    {Icons.alert}
-                    <div>
-                      <b>ต้องตัดสินใจ:</b> กรมธรรม์เหล่านี้ถึงกำหนดส่งบริษัทแล้ว
-                      แต่ลูกค้าชำระยังไม่ถึง 2 งวด (และไม่ใช่จ่ายเต็ม)
-                      <br/>
-                      <span style={{ fontSize:12 }}>
-                        → ถ้าจะส่ง: <b>สำรองเงินส่วนตัวก่อน</b> แล้วรอลูกค้าจ่ายงวดที่ 2
-                        เพื่อไม่ให้กรมธรรม์ยกเลิกและเสียค่าปรับ
-                      </span>
+                {displayed.length === 0 ? (
+                  <EmptyState icon={tab === 'ready' ? '✅' : tab === 'risk' ? '⚠️' : '📊'}
+                    title="ไม่มีรายการในหมวดนี้"
+                    sub={tab === 'ready' ? 'ยังไม่มีกรมธรรม์ที่ถึงกำหนดและผ่านเงื่อนไข' : tab === 'risk' ? 'ดีมาก ไม่มีรายการที่ต้องสำรองจ่าย' : 'ไม่มีกรมธรรม์ในรอบที่เลือก'}
+                  />
+                ) : (
+                  <>
+                    <div style={{ overflowX: 'auto' }}>
+                      <table style={{
+                        width: '100%', borderCollapse: 'collapse', fontSize: 13,
+                      }}>
+                        <thead>
+                          <tr style={{ background: '#f1f5f9', borderBottom: '2px solid #e2e8f0' }}>
+                            <Th center w={44}>
+                              <input
+                                type="checkbox" checked={allChecked}
+                                ref={el => { if (el) el.indeterminate = someChecked && !allChecked }}
+                                onChange={toggleAll} style={{ cursor: 'pointer' }}
+                              />
+                            </Th>
+                            <Th>กรมธรรม์ / ลูกค้า</Th>
+                            <Th center w={80}>ประเภท</Th>
+                            <Th center w={130}>การชำระของลูกค้า</Th>
+                            <Th center w={110}>วันเริ่มคุ้มครอง</Th>
+                            <Th center w={180}>รอบตัด → ส่งภายใน</Th>
+                            <Th center w={110}>สถานะ</Th>
+                            <Th right w={130}>ยอดส่งบริษัท</Th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {displayed.map((p, idx) => (
+                            <PolicyRow
+                              key={p.id} p={p} idx={idx}
+                              checked={checkedIds.has(p.id)}
+                              onToggle={() => toggleCheck(p.id)}
+                            />
+                          ))}
+                        </tbody>
+                      </table>
                     </div>
-                  </div>
-                )}
 
-                {tab === 'recon' && (
-                  <div className="alert i">
-                    {Icons.shield}
-                    <div>
-                      <b>วิธีใช้ Format 3:</b> Export CSV → เปิดใน Excel
-                      → VLOOKUP เทียบเลขกรมธรรม์กับ Statement ที่บริษัทส่งมาสิ้นเดือน
-                      <br/>
-                      <span style={{ fontSize:12 }}>
-                        ถ้ารายการไหนโผล่มาเกินหรือขาด → แย้งบริษัทได้ทันที
-                        พร้อมข้อมูลวันคุ้มครอง วันกำหนดส่ง และยอดที่ควรจะเป็น
+                    {/* Footer total */}
+                    <div style={{
+                      display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+                      padding: '14px 18px', borderTop: '2px solid #e2e8f0',
+                      background: '#f8fafc',
+                    }}>
+                      <span style={{ fontSize: 13, color: '#64748b', fontWeight: 500 }}>
+                        {someChecked ? `ยอดรวม ${checkedIds.size} รายการที่เลือก` : `ยอดรวม ${displayed.length} รายการ`}
+                        <span style={{ fontSize: 11, marginLeft: 6, color: '#94a3b8' }}>
+                          (Net Premium ที่ต้องโอนให้บริษัท)
+                        </span>
                       </span>
+                      <div style={{ textAlign: 'right' }}>
+                        <div style={{ fontSize: 22, fontWeight: 800, color: '#1e40af', fontFeatureSettings: '"tnum"' }}>
+                          {fmtB(footerTotal)}
+                        </div>
+                      </div>
                     </div>
-                  </div>
+                  </>
                 )}
-              </>
-            )}
-          </div>
-        </div>
+              </div>
+            </>
+          )}
+        </main>
       </div>
     </div>
   )
 }
 
-// ─── Sub-components ──────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// SUB-COMPONENTS
+// ─────────────────────────────────────────────────────────────────────────────
 
-function PolicyRow({ p }) {
+function PolicyRow({ p, idx, checked, onToggle }) {
+  const disabled  = p.travelLocked
+  const isEvenRow = idx % 2 === 0
+  const bg = checked ? '#eff6ff' : isEvenRow ? '#fff' : '#fafafa'
+
   return (
-    <tr style={{ opacity: p.travelLocked ? .65 : 1 }}>
-      <td>
-        <code style={{ fontSize:11, color:'var(--blue-700)' }}>{p.id}</code>
-        {p.isCreditCard && (
-          <span style={{
-            marginLeft:4, fontSize:10,
-            background:'#fee2e2', color:'#991b1b',
-            padding:'1px 5px', borderRadius:4,
-          }}>
-            💳
-          </span>
-        )}
-        {p.travelLocked && (
-          <span style={{
-            marginLeft:4, fontSize:10,
-            background:'#fef3c7', color:'#92400e',
-            padding:'1px 5px', borderRadius:4,
-          }}>
-            🔒 Travel
-          </span>
-        )}
+    <tr style={{
+      background: bg, opacity: disabled ? .5 : 1,
+      borderBottom: '1px solid #e2e8f0',
+      transition: 'background .1s',
+    }}>
+      {/* Checkbox */}
+      <td style={{ textAlign: 'center', padding: '12px 0', width: 44 }}>
+        <input
+          type="checkbox" checked={checked} onChange={onToggle} disabled={disabled}
+          title={disabled ? 'Travel Lock — ยังไม่ถึงกำหนดส่ง' : undefined}
+          style={{ cursor: disabled ? 'not-allowed' : 'pointer', width: 15, height: 15 }}
+        />
       </td>
-      <td style={{ fontSize:13 }}>{p.customers?.name}</td>
-      <td><span className="badge b-bl">{p.coverage_type}</span></td>
-      <td style={{ fontSize:12, color:'var(--muted)' }}>{p.pay_mode ?? '—'}</td>
-      <td>
+
+      {/* กรมธรรม์ + ลูกค้า */}
+      <td style={{ padding: '12px 14px' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+          <code style={{
+            fontSize: 12, fontWeight: 700, color: '#1d4ed8',
+            background: '#eff6ff', padding: '2px 6px', borderRadius: 5,
+          }}>
+            {p.id}
+          </code>
+          {p.isCreditCard && <MicroBadge bg="#fee2e2" color="#991b1b" text="💳 บัตร" />}
+          {p.travelLocked && <MicroBadge bg="#fef3c7" color="#92400e" text="🔒 Travel" />}
+        </div>
+        <div style={{ fontSize: 12, color: '#475569', marginTop: 4, fontWeight: 500 }}>
+          {p.customers?.name ?? '—'}
+        </div>
+      </td>
+
+      {/* ประเภท */}
+      <td style={{ padding: '12px 14px', textAlign: 'center' }}>
         <span style={{
-          fontSize:12, fontWeight:600,
-          color: p.paidCount >= 2 || p.isFullPay
-            ? 'var(--green-600)'
-            : 'var(--amber-600)',
+          fontSize: 11, fontWeight: 600, padding: '3px 10px', borderRadius: 6,
+          background: '#f1f5f9', color: '#475569', whiteSpace: 'nowrap',
         }}>
-          {p.paidCount}/{p.totalInst}
+          {p.coverage_type ?? '—'}
         </span>
-        {p.isFullPay && (
-          <span style={{
-            marginLeft:4, fontSize:10,
-            background:'#dcfce7', color:'#166534',
-            padding:'1px 5px', borderRadius:4,
-          }}>
-            เต็ม
-          </span>
+      </td>
+
+      {/* การชำระของลูกค้า */}
+      <td style={{ padding: '12px 14px', textAlign: 'center' }}>
+        <div style={{
+          fontSize: 12, fontWeight: 700,
+          color: p.isEligible ? '#166534' : '#d97706',
+        }}>
+          {p.clientStatus}
+        </div>
+        {!p.isFullPay && p.totalInst > 0 && (
+          <div style={{ fontSize: 10, color: '#94a3b8', marginTop: 2 }}>
+            จ่ายแล้ว {p.paidCount} จาก {p.totalInst} งวด
+          </div>
         )}
       </td>
-      <td style={{ fontSize:12 }}>
-        {p.remitDeadline ? (
-          <span style={{ color: p.isOverdue ? '#dc2626' : 'var(--muted)' }}>
-            {p.remitDeadline.toLocaleDateString('th-TH', { day:'numeric', month:'short' })}
-            {' '}
-            {p.isOverdue
-              ? <b>(เกินกำหนด)</b>
-              : p.daysLeft != null
-                ? `(${p.daysLeft} ว.)`
-                : ''}
-          </span>
-        ) : '—'}
+
+      {/* วันเริ่มคุ้มครอง + กลุ่ม */}
+      <td style={{ padding: '12px 14px', textAlign: 'center' }}>
+        <div style={{ fontSize: 12, fontWeight: 600, color: '#1e293b' }}>
+          {fmtThShort(p.policy_start)}
+        </div>
+        <div style={{ fontSize: 10, color: '#94a3b8', marginTop: 2 }}>
+          {p.group === 1 ? 'กลุ่ม 1 (1–15)' : 'กลุ่ม 2 (16–EOM)'}
+        </div>
       </td>
-      <td>
-        {p.isRisk ? (
+
+      {/* รอบตัด + กำหนดส่ง */}
+      <td style={{ padding: '12px 14px', textAlign: 'center' }}>
+        <div style={{ fontSize: 11, color: '#94a3b8' }}>
+          ตัดรอบ {fmtThShort(p.cutoffDate)}
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 4, marginTop: 3 }}>
           <span style={{
-            fontSize:11, fontWeight:600,
-            background:'#fef3c7', color:'#92400e',
-            padding:'2px 8px', borderRadius:6,
+            fontSize: 12, fontWeight: 700,
+            color: p.isOverdue ? '#dc2626' : p.isDueToday ? '#dc2626' : p.daysLeft != null && p.daysLeft <= 7 ? '#d97706' : '#1e293b',
           }}>
-            ⚠️ เสี่ยง
+            {fmtThShort(p.remitDeadline)}
           </span>
-        ) : p.isEligible && p.isOverdue ? (
-          <span style={{
-            fontSize:11, fontWeight:600,
-            background:'#dcfce7', color:'#166534',
-            padding:'2px 8px', borderRadius:6,
-          }}>
-            ✅ ส่งได้
-          </span>
+          {p.isDueToday && <span style={{ fontSize: 10, background: '#fee2e2', color: '#dc2626', padding: '1px 5px', borderRadius: 4, fontWeight: 700 }}>วันนี้!</span>}
+          {p.isOverdue && !p.isDueToday && <span style={{ fontSize: 10, background: '#fee2e2', color: '#dc2626', padding: '1px 5px', borderRadius: 4, fontWeight: 700 }}>เกิน</span>}
+          {!p.isDue && p.daysLeft != null && p.daysLeft <= 7 && (
+            <span style={{ fontSize: 10, color: '#d97706' }}>({p.daysLeft} ว.)</span>
+          )}
+        </div>
+      </td>
+
+      {/* สถานะ */}
+      <td style={{ padding: '12px 14px', textAlign: 'center' }}>
+        {p.travelLocked ? (
+          <StatusPill bg="#fef3c7" color="#92400e" text="🔒 Travel Lock" />
+        ) : p.isRisk ? (
+          <StatusPill bg="#fef3c7" color="#92400e" text="⚠️ ต้องสำรองจ่าย" bold />
+        ) : p.isDue && p.isEligible ? (
+          <StatusPill bg="#dcfce7" color="#166534" text="✅ ส่งได้เลย" bold />
         ) : p.isEligible ? (
-          <span style={{
-            fontSize:11,
-            background:'#f1f5f9', color:'var(--muted)',
-            padding:'2px 8px', borderRadius:6,
-          }}>
-            🕐 รอถึงกำหนด
-          </span>
+          <StatusPill bg="#f1f5f9" color="#64748b" text="🕐 รอถึงกำหนด" />
         ) : (
-          <span style={{
-            fontSize:11,
-            background:'#fff1f2', color:'#be123c',
-            padding:'2px 8px', borderRadius:6,
-          }}>
-            ยังไม่ผ่าน
-          </span>
+          <StatusPill bg="#fff1f2" color="#be123c" text="ยังไม่ผ่านเงื่อนไข" />
         )}
       </td>
-      <td className="tnum" style={{ textAlign:'right', fontWeight:600 }}>
-        {fmtB(p.totalPaid)}
+
+      {/* ยอดส่งบริษัท */}
+      <td style={{ padding: '12px 18px', textAlign: 'right' }}>
+        <div style={{ fontSize: 15, fontWeight: 800, color: '#1e293b', fontFeatureSettings: '"tnum"' }}>
+          {fmtB(p.netPremium)}
+        </div>
+        <div style={{ fontSize: 10, color: '#94a3b8', marginTop: 2 }}>
+          Net Premium
+        </div>
       </td>
     </tr>
   )
 }
 
-function MiniKV({ label, value, sub, valueColor }) {
+// ── Atom components ────────────────────────────────────────────────────────
+
+function Th({ children, center, right, w }) {
   return (
-    <div style={{ background:'var(--slate-50)', borderRadius:8, padding:'10px 12px' }}>
-      <div className="kv" style={{ fontSize:10 }}>{label}</div>
-      <div style={{
-        fontWeight:600, fontSize:14, marginTop:3,
-        color: valueColor ?? 'inherit',
-      }}>
-        {value}
-      </div>
-      {sub && (
-        <div style={{ fontSize:10, color:'var(--muted)', marginTop:2 }}>{sub}</div>
-      )}
+    <th style={{
+      padding: '10px 14px', fontSize: 11, fontWeight: 700, color: '#64748b',
+      textAlign: center ? 'center' : right ? 'right' : 'left',
+      whiteSpace: 'nowrap', width: w,
+      letterSpacing: .3,
+    }}>
+      {children}
+    </th>
+  )
+}
+
+function StatusPill({ bg, color, text, bold }) {
+  return (
+    <span style={{
+      display: 'inline-block', fontSize: 11, fontWeight: bold ? 700 : 500,
+      background: bg, color, padding: '4px 10px', borderRadius: 20,
+      whiteSpace: 'nowrap',
+    }}>
+      {text}
+    </span>
+  )
+}
+
+function MicroBadge({ bg, color, text }) {
+  return (
+    <span style={{
+      fontSize: 10, background: bg, color,
+      padding: '1px 6px', borderRadius: 4, fontWeight: 600,
+    }}>
+      {text}
+    </span>
+  )
+}
+
+function SummaryPill({ color, bg, label, count }) {
+  return (
+    <div style={{
+      display: 'flex', alignItems: 'center', gap: 6,
+      background: bg, borderRadius: 20, padding: '4px 12px',
+    }}>
+      <span style={{ fontSize: 11, color, fontWeight: 600 }}>{label}</span>
+      <span style={{ fontSize: 13, fontWeight: 800, color }}>{count}</span>
     </div>
   )
 }
 
-function ExportButton({ emoji, label, desc, hint, color, onClick }) {
+function AlertBanner({ children, color, bg, border }) {
   return (
-    <button
-      onClick={onClick}
-      style={{
-        display:'flex', flexDirection:'column', gap:3,
-        padding:'12px 16px', borderRadius:8,
-        cursor:'pointer', textAlign:'left',
-        background: color, color:'#fff', border:'none',
-        minWidth:170, transition:'opacity .15s',
-      }}
-      onMouseOver={e => e.currentTarget.style.opacity = '.85'}
-      onMouseOut={e  => e.currentTarget.style.opacity = '1'}
+    <div style={{
+      background: bg, border: `1.5px solid ${border}`,
+      borderRadius: 10, padding: '12px 16px',
+      fontSize: 13, color, lineHeight: 1.6,
+    }}>
+      {children}
+    </div>
+  )
+}
+
+function DashCard({ icon, label, sub, amount, color, bg, border }) {
+  return (
+    <div style={{
+      background: bg, border: `1.5px solid ${border}`,
+      borderRadius: 10, padding: '14px 16px',
+    }}>
+      <div style={{ fontSize: 11, color: '#64748b', marginBottom: 6 }}>
+        {icon} {label}
+      </div>
+      <div style={{ fontSize: 20, fontWeight: 800, color, fontFeatureSettings: '"tnum"' }}>
+        {amount}
+      </div>
+      <div style={{ fontSize: 11, color: '#94a3b8', marginTop: 4 }}>{sub}</div>
+    </div>
+  )
+}
+
+function ExportCard({ icon, label, sub, color, onClick }) {
+  return (
+    <button onClick={onClick} style={{
+      display: 'flex', flexDirection: 'column', gap: 1,
+      padding: '8px 14px', borderRadius: 8,
+      background: color, color: '#fff', border: 'none',
+      cursor: 'pointer', textAlign: 'left',
+      transition: 'opacity .15s',
+    }}
+    onMouseOver={e => e.currentTarget.style.opacity = '.85'}
+    onMouseOut={e  => e.currentTarget.style.opacity = '1'}
     >
-      <span style={{ fontSize:13, fontWeight:700 }}>{emoji} {label}</span>
-      <span style={{ fontSize:11, opacity:.9 }}>{desc}</span>
-      <span style={{ fontSize:10, opacity:.65, marginTop:2 }}>ใช้เมื่อ: {hint}</span>
+      <span style={{ fontSize: 12, fontWeight: 700 }}>{icon} {label}</span>
+      <span style={{ fontSize: 10, opacity: .8 }}>{sub}</span>
     </button>
+  )
+}
+
+function FormatGuide({ n, label, desc }) {
+  return (
+    <div style={{ display: 'flex', gap: 8, alignItems: 'flex-start' }}>
+      <span style={{
+        fontSize: 10, fontWeight: 700, background: '#1e293b', color: '#fff',
+        width: 16, height: 16, borderRadius: '50%', flexShrink: 0,
+        display: 'flex', alignItems: 'center', justifyContent: 'center',
+      }}>
+        {n}
+      </span>
+      <div>
+        <div style={{ fontSize: 11, fontWeight: 700, color: '#1e293b' }}>{label}</div>
+        <div style={{ fontSize: 10, color: '#94a3b8', marginTop: 1 }}>{desc}</div>
+      </div>
+    </div>
+  )
+}
+
+function EmptyState({ icon, title, sub }) {
+  return (
+    <div style={{
+      display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center',
+      padding: '48px 24px', gap: 10, color: '#94a3b8',
+    }}>
+      <div style={{ fontSize: 40 }}>{icon}</div>
+      <div style={{ fontSize: 15, fontWeight: 600, color: '#64748b' }}>{title}</div>
+      {sub && <div style={{ fontSize: 13 }}>{sub}</div>}
+    </div>
   )
 }

@@ -124,6 +124,17 @@ export default function NewPolicyPage() {
   const [instCount,   setInstCount]   = useState(4)
   const [instAmounts, setInstAmounts] = useState([])
 
+  // payment details (Step 2)
+  const [isPaid, setIsPaid] = useState(false)
+  const [payDetails, setPayDetails] = useState({
+    channel: 'โอนเข้าบริษัทประกันโดยตรง',
+    amount: '',
+    notes: ''
+  })
+  const [slipFile, setSlipFile] = useState(null)
+  const [slipPreview, setSlipPreview] = useState(null)
+  const slipInputRef = useRef(null)
+
   const [form, setForm] = useState({
     id:            genPolicyId(),
     customer_id:   presetCustId,
@@ -151,6 +162,15 @@ export default function NewPolicyPage() {
 
   const setF  = (k, v) => setForm(f => ({ ...f, [k]: v }))
   const setNC = (k, v) => setNewCust(f => ({ ...f, [k]: v }))
+
+  // Sync ยอดชำระงวดแรก
+  useEffect(() => {
+    if (form.pay_mode === 'installment' && instAmounts.length > 0) {
+      setPayDetails(prev => ({ ...prev, amount: instAmounts[0] }))
+    } else {
+      setPayDetails(prev => ({ ...prev, amount: form.premium }))
+    }
+  }, [form.pay_mode, instAmounts, form.premium])
 
   // ─── load ─────────────────────────────────────────────────────────────────
 
@@ -411,6 +431,7 @@ export default function NewPolicyPage() {
       company_id: form.company_id, agent_code: form.agent_code,
       coverage_type: form.coverage_type,
       plate: form.plate || null, model: form.model || null,
+      plate_province: form.plate_province || null,
       premium: parseFloat(form.premium),
       policy_start: form.policy_start || null, policy_end: form.policy_end || null,
       policy_status: 'active', pay_mode: form.pay_mode,
@@ -418,17 +439,45 @@ export default function NewPolicyPage() {
     })
     if (polErr) { alert('บันทึกไม่สำเร็จ: ' + polErr.message); setSaving(false); return }
 
+    // อัปโหลดสลิป (ถ้าลูกค้าจ่ายแล้วและมีการแนบไฟล์)
+    let uploadedSlipUrl = null
+    if (isPaid && slipFile) {
+      const ext = slipFile.name.split('.').pop() || 'jpg'
+      const path = `${user.id}/${form.id}-slip-inst1.${ext}`
+      const { error: upErr } = await supabase.storage.from('payment-slips').upload(path, slipFile, { upsert: true })
+      if (!upErr) uploadedSlipUrl = path
+      else console.warn('[Storage Slip]', upErr.message)
+    }
+
     if (form.pay_mode === 'installment') {
       const rows = instAmounts.map((amt, i) => {
         const due = new Date(form.policy_start); due.setMonth(due.getMonth() + i)
-        return { policy_id: form.id, installment_no: i + 1, total_inst: instCount, amount_due: amt, due_date: due.toISOString().split('T')[0], user_id: user.id }
+        const isFirstInstPaid = (i === 0 && isPaid);
+        return { 
+          policy_id: form.id, 
+          installment_no: i + 1, 
+          total_inst: instCount, 
+          amount_due: amt, 
+          due_date: due.toISOString().split('T')[0], 
+          user_id: user.id,
+          paid_at: isFirstInstPaid ? new Date().toISOString() : null,
+          paid_amount: isFirstInstPaid ? parseFloat(payDetails.amount || amt) : null,
+          payment_channel: isFirstInstPaid ? payDetails.channel : null,
+          notes: isFirstInstPaid ? payDetails.notes : null,
+          slip_url: isFirstInstPaid ? uploadedSlipUrl : null,
+        }
       })
       await supabase.from('installments').insert(rows)
     } else {
       await supabase.from('installments').insert({
         policy_id: form.id, installment_no: 1, total_inst: 1,
         amount_due: parseFloat(form.premium), due_date: form.policy_start,
-        paid_at: new Date().toISOString(), paid_amount: parseFloat(form.premium), user_id: user.id,
+        user_id: user.id,
+        paid_at: isPaid ? new Date().toISOString() : null,
+        paid_amount: isPaid ? parseFloat(form.premium) : null,
+        payment_channel: isPaid ? payDetails.channel : null,
+        notes: isPaid ? payDetails.notes : null,
+        slip_url: isPaid ? uploadedSlipUrl : null,
       })
     }
     router.push(`/policies/${form.id}`)
@@ -879,17 +928,68 @@ export default function NewPolicyPage() {
               <div style={{ marginBottom: 20 }}>
                 <label style={S.label}>วิธีชำระ</label>
                 <div style={{ display: 'flex', gap: 8 }}>
-                  {[{ id: 'cash', label: '💵 เงินสด (ครั้งเดียว)' }, { id: 'installment', label: '📅 ผ่อนชำระ' }].map(m => (
-                    <button key={m.id} type="button" onClick={() => setF('pay_mode', m.id)}
-                      style={{ ...chip(form.pay_mode === m.id), padding: '10px 20px' }}>{m.label}</button>
-                  ))}
+                  <button type="button" onClick={() => { setF('pay_mode', 'cash'); setIsPaid(false) }}
+                    style={{ ...chip(form.pay_mode === 'cash'), padding: '10px 20px' }}>💵 ชำระเต็มจำนวน</button>
+                  <button type="button" onClick={() => { setF('pay_mode', 'installment'); setIsPaid(false) }}
+                    style={{ ...chip(form.pay_mode === 'installment'), padding: '10px 20px' }}>📅 ผ่อนชำระ</button>
                 </div>
               </div>
 
+              {/* ── ชำระเต็มจำนวน ── */}
               {form.pay_mode === 'cash' && (
-                <div style={S.alertOk}>✅ <div>ชำระเงินสดครั้งเดียว <b>{fmtB(parseFloat(form.premium) || 0)}</b> — งวดบันทึก "ชำระแล้ว" ทันที</div></div>
+                <div style={{ padding: 16, border: '1px solid #e2e8f0', borderRadius: 8, background: '#f8fafc' }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
+                    <div>ยอดที่ต้องชำระ: <b style={{ fontSize: 16, color: '#0f172a' }}>{fmtB(parseFloat(form.premium) || 0)}</b></div>
+                  </div>
+
+                  <label style={{ ...S.label, fontSize: 13, color: '#0f172a' }}>ลูกค้าชำระเงินเข้ามาหรือยัง?</label>
+                  <div style={{ display: 'flex', gap: 20, marginBottom: isPaid ? 16 : 0 }}>
+                    <label style={{ display: 'flex', alignItems: 'center', gap: 6, cursor: 'pointer', fontSize: 13 }}>
+                      <input type="radio" checked={!isPaid} onChange={() => setIsPaid(false)} />
+                      ยังไม่ชำระ (เก็บเงินทีหลัง)
+                    </label>
+                    <label style={{ display: 'flex', alignItems: 'center', gap: 6, cursor: 'pointer', fontSize: 13 }}>
+                      <input type="radio" checked={isPaid} onChange={() => setIsPaid(true)} />
+                      ชำระเรียบร้อยแล้ว
+                    </label>
+                  </div>
+
+                  {/* ฟอร์มข้อมูลการโอน (เต็มจำนวน) */}
+                  {isPaid && (
+                    <div style={{ display: 'grid', gap: 12, padding: 16, background: '#fff', borderRadius: 8, border: '1px solid #e2e8f0', marginTop: 16 }}>
+                      <div style={S.grid}>
+                        <div>
+                          <label style={S.label}>ช่องทางโอนเงิน</label>
+                          <select style={S.select} value={payDetails.channel} onChange={e => setPayDetails({ ...payDetails, channel: e.target.value })}>
+                            <option>โอนเข้าบริษัทประกันโดยตรง</option>
+                            <option>โอนผ่านบัญชีตัวแทน</option>
+                          </select>
+                        </div>
+                        <div>
+                          <label style={S.label}>แนบหลักฐาน (สลิป)</label>
+                          <input type="file" accept="image/*" ref={slipInputRef} style={{ display: 'none' }}
+                            onChange={e => {
+                              const file = e.target.files?.[0]; 
+                              if(file) { setSlipFile(file); setSlipPreview(URL.createObjectURL(file)) }
+                            }} 
+                          />
+                          <button type="button" style={{ ...S.btnSec, width: '100%', justifyContent: 'center' }} onClick={() => slipInputRef.current?.click()}>
+                            {slipFile ? `✅ ${slipFile.name}` : '📁 แนบสลิปโอนเงิน'}
+                          </button>
+                        </div>
+                      </div>
+                      <div>
+                        <label style={S.label}>หมายเหตุการโอน (ตัวเลือก)</label>
+                        <input style={S.input} placeholder="เช่น โอนเข้า SCB ตัวแทน, ลูกค้าจ่ายเงินสด..." 
+                          value={payDetails.notes} onChange={e => setPayDetails({ ...payDetails, notes: e.target.value })} />
+                      </div>
+                      {slipPreview && <img src={slipPreview} alt="Slip" style={{ height: 100, objectFit: 'contain', borderRadius: 8, border: '1px solid #e2e8f0' }} />}
+                    </div>
+                  )}
+                </div>
               )}
 
+              {/* ── ผ่อนชำระ ── */}
               {form.pay_mode === 'installment' && (
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
                   <div>
@@ -901,6 +1001,7 @@ export default function NewPolicyPage() {
                       ))}
                     </div>
                   </div>
+                  
                   {instAmounts.length > 0 && (
                     <table style={{ width: '100%', borderCollapse: 'collapse', border: '1px solid #e2e8f0', borderRadius: 8, overflow: 'hidden' }}>
                       <thead>
@@ -933,6 +1034,64 @@ export default function NewPolicyPage() {
                       </tbody>
                     </table>
                   )}
+
+                  <div style={{ padding: 16, border: '1px solid #e2e8f0', borderRadius: 8, background: '#f8fafc' }}>
+                    <label style={{ ...S.label, fontSize: 13, color: '#0f172a' }}>ลูกค้าชำระเงิน "งวดที่ 1" เข้ามาหรือยัง?</label>
+                    <div style={{ display: 'flex', gap: 20, marginBottom: isPaid ? 16 : 0 }}>
+                      <label style={{ display: 'flex', alignItems: 'center', gap: 6, cursor: 'pointer', fontSize: 13 }}>
+                        <input type="radio" checked={!isPaid} onChange={() => setIsPaid(false)} />
+                        ยังไม่ชำระ
+                      </label>
+                      <label style={{ display: 'flex', alignItems: 'center', gap: 6, cursor: 'pointer', fontSize: 13 }}>
+                        <input type="radio" checked={isPaid} onChange={() => setIsPaid(true)} />
+                        ชำระงวดแรกแล้ว
+                      </label>
+                    </div>
+
+                    {/* ฟอร์มข้อมูลการโอน (งวด 1) */}
+                    {isPaid && (
+                      <div style={{ display: 'grid', gap: 12, padding: 16, background: '#fff', borderRadius: 8, border: '1px solid #e2e8f0', marginTop: 16 }}>
+                        <div style={S.grid}>
+                          <div>
+                            <label style={S.label}>ยอดที่ชำระ (สามารถแก้ปัดเศษได้)</label>
+                            <input style={S.input} type="number" value={payDetails.amount} 
+                              onChange={e => setPayDetails({ ...payDetails, amount: e.target.value })} />
+                          </div>
+                          <div>
+                            <label style={S.label}>ช่องทางโอนเงิน</label>
+                            <select style={S.select} value={payDetails.channel} onChange={e => setPayDetails({ ...payDetails, channel: e.target.value })}>
+                              <option>โอนเข้าบริษัทประกันโดยตรง</option>
+                              <option>โอนผ่านบัญชีตัวแทน</option>
+                            </select>
+                          </div>
+                        </div>
+                        <div style={S.grid}>
+                          <div style={S.full}>
+                            <label style={S.label}>แนบหลักฐาน (สลิปงวด 1)</label>
+                            <input type="file" accept="image/*" ref={slipInputRef} style={{ display: 'none' }}
+                              onChange={e => {
+                                const file = e.target.files?.[0]; 
+                                if(file) { setSlipFile(file); setSlipPreview(URL.createObjectURL(file)) }
+                              }} 
+                            />
+                            <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
+                              <button type="button" style={{ ...S.btnSec }} onClick={() => slipInputRef.current?.click()}>
+                                {slipFile ? `เปลี่ยนสลิป` : '📁 แนบสลิปโอนเงิน'}
+                              </button>
+                              {slipFile && <span style={{ fontSize: 13, color: '#16a34a', fontWeight: 600 }}>✅ {slipFile.name}</span>}
+                            </div>
+                            {slipPreview && <img src={slipPreview} alt="Slip" style={{ height: 100, marginTop: 10, objectFit: 'contain', borderRadius: 8, border: '1px solid #e2e8f0' }} />}
+                          </div>
+                          <div style={S.full}>
+                            <label style={S.label}>หมายเหตุการโอน</label>
+                            <input style={S.input} placeholder="ระบุเพิ่มเติมถ้ามี..." 
+                              value={payDetails.notes} onChange={e => setPayDetails({ ...payDetails, notes: e.target.value })} />
+                          </div>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+
                 </div>
               )}
             </div>
