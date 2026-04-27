@@ -5,7 +5,9 @@ import { useRouter, useParams } from 'next/navigation'
 import Link from 'next/link'
 import { createClient } from '@/lib/supabase/client'
 import { Icons, fmtB, fmtDate } from '@/components/ui/Icons'
-import { getInstallmentStatus, STATUS_LABEL } from '@/lib/domain/installment'
+import { getInstallmentStatus, STATUS_LABEL } from '@/lib/domains/installment/service'
+import PaymentForm from '@/components/domain/PaymentForm'
+import * as storage from '@/lib/storage'
 
 // --- Helper: Regex Extractors ---
 function parsePolicyNotes(rawNotes) {
@@ -51,6 +53,11 @@ export default function PolicyDetailPage() {
   const [payModal, setPayModal] = useState(null)
   const [delModal, setDelModal] = useState(false)
 
+  // Retro-slip state — for paid installments missing a slip.
+  const [retroInst,   setRetroInst]   = useState(null)
+  const [retroFile,   setRetroFile]   = useState(null)
+  const [retroSaving, setRetroSaving] = useState(false)
+
   // Viewer State 
   const [viewerPath, setViewerPath] = useState(null)
   const [viewerUrl, setViewerUrl] = useState(null)
@@ -67,13 +74,14 @@ export default function PolicyDetailPage() {
         return
       }
       setViewerLoading(true)
-      const { data, error } = await supabase.storage.from('policy-docs').createSignedUrl(viewerPath, 60 * 60)
+      const bucket = viewerType === 'slip' ? 'payment-slips' : 'policy-docs'
+      const { data, error } = await supabase.storage.from(bucket).createSignedUrl(viewerPath, 60 * 60)
       if (error) console.error("Error loading document:", error)
       setViewerUrl(data?.signedUrl || null)
       setViewerLoading(false)
     }
     fetchSignedUrl()
-  }, [viewerPath])
+  }, [viewerPath, viewerType])
 
   async function load() {
     setLoading(true)
@@ -112,6 +120,51 @@ export default function PolicyDetailPage() {
   async function deletePolicy() {
     await supabase.from('policies').delete().eq('id', id)
     router.push('/policies')
+  }
+
+  // Cash policy with no installment yet → create installment first, then open PaymentForm.
+  async function openNewFullPayment() {
+    const { data: { user } } = await supabase.auth.getUser()
+    const { data: newInst, error } = await supabase
+      .from('installments')
+      .insert({
+        policy_id:      policy.id,
+        user_id:        user.id,
+        installment_no: 1,
+        total_inst:     1,
+        amount_due:     parseFloat(policy.premium),
+        due_date:       policy.policy_start,
+      })
+      .select().single()
+    if (error) { alert('เปิดงวดไม่สำเร็จ: ' + error.message); return }
+    setInsts([newInst])
+    setPayModal(newInst)
+  }
+
+  // Retro-slip: attach a slip to an already-paid installment.
+  // Updates payments.slip_path (canonical) + installments.slip_url (legacy reader).
+  async function saveRetroSlip() {
+    if (!retroFile || !retroInst) return
+    setRetroSaving(true)
+    try {
+      const { data: { user } } = await supabase.auth.getUser()
+      const { data: lastPayment } = await supabase
+        .from('payments').select('id')
+        .eq('installment_id', retroInst.id)
+        .order('paid_at', { ascending: false }).limit(1).maybeSingle()
+      if (!lastPayment) throw new Error('ไม่พบข้อมูลการชำระเงิน')
+      const path = await storage.uploadSlip(supabase, {
+        userId: user.id, paymentId: lastPayment.id, file: retroFile,
+      })
+      await supabase.from('payments').update({ slip_path: path }).eq('id', lastPayment.id)
+      await supabase.from('installments').update({ slip_url: path }).eq('id', retroInst.id)
+      setRetroInst(null); setRetroFile(null)
+      load()
+    } catch (err) {
+      alert('อัปโหลดสลิปไม่สำเร็จ: ' + (err.message ?? ''))
+    } finally {
+      setRetroSaving(false)
+    }
   }
 
   if (loading) return <div style={{ padding: 32 }}>กำลังโหลด...</div>
@@ -286,7 +339,7 @@ export default function PolicyDetailPage() {
                           {isPolicyActive ? (
                             <button 
                               className="btn ok sm" 
-                              onClick={() => setPayModal({ isNewFullPayment: true, amount_due: policy.premium, installment_no: 1, total_inst: 1 })} 
+                              onClick={openNewFullPayment}
                               style={{ width: '100%', justifyContent: 'center' }}
                             >
                               ➕ รับชำระ
@@ -341,7 +394,7 @@ export default function PolicyDetailPage() {
                             <button 
                               className="btn sm" 
                               style={{ width: '100%', justifyContent: 'center', background: '#f1f5f9', color: '#475569', border: '1px solid #cbd5e1' }}
-                              onClick={() => setPayModal(inst)}
+                              onClick={() => setRetroInst(inst)}
                             >
                               ➕ แนบสลิปย้อนหลัง
                             </button>
@@ -410,12 +463,46 @@ export default function PolicyDetailPage() {
       </div>
 
       {payModal && (
-        <PayModal
-          inst={payModal}
+        <PaymentForm
+          installment={payModal}
           policy={policy}
+          summary={{
+            totalPremium: Number(policy.premium) || insts.reduce((s, i) => s + Number(i.amount_due), 0),
+            totalPaid:    insts.filter(i => i.paid_at).reduce((s, i) => s + Number(i.paid_amount ?? 0), 0),
+          }}
           onClose={() => setPayModal(null)}
-          onPaid={() => { setPayModal(null); load() }}
+          onSaved={() => { setPayModal(null); load() }}
         />
+      )}
+
+      {retroInst && (
+        <div className="mov" onClick={() => setRetroInst(null)}>
+          <div className="modal" onClick={e => e.stopPropagation()} style={{ maxWidth: 400 }}>
+            <div className="m-h">
+              <h2 className="m-t">แนบสลิปย้อนหลัง · งวด {retroInst.installment_no}/{retroInst.total_inst}</h2>
+              <button className="ib" style={{ marginLeft: 'auto' }} onClick={() => setRetroInst(null)}>{Icons.x}</button>
+            </div>
+            <div className="m-b" style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+              <div className="field">
+                <label>ไฟล์สลิป</label>
+                <input
+                  type="file"
+                  accept="image/jpeg,image/png,image/webp,application/pdf"
+                  onChange={e => setRetroFile(e.target.files?.[0] ?? null)}
+                  className="input"
+                  style={{ padding: 8 }}
+                />
+                <span className="hint">JPG / PNG / WEBP / PDF · ไม่เกิน 10 MB</span>
+              </div>
+            </div>
+            <div className="m-f">
+              <button className="btn sec" onClick={() => setRetroInst(null)}>ยกเลิก</button>
+              <button className="btn ok" onClick={saveRetroSlip} disabled={retroSaving || !retroFile}>
+                {retroSaving ? 'กำลังบันทึก...' : `${Icons.check} บันทึกสลิป`}
+              </button>
+            </div>
+          </div>
+        </div>
       )}
 
       {delModal && (
@@ -448,117 +535,6 @@ function KV({ label, value, mono }) {
       <div style={{ fontSize: 12, color: 'var(--muted)', marginBottom: 4 }}>{label}</div>
       <div style={{ fontWeight: 500, ...(mono ? { fontFamily: 'monospace', fontSize: 13, background: '#f1f5f9', padding: '2px 6px', borderRadius: 4, display: 'inline-block' } : {}) }}>
         {value || '—'}
-      </div>
-    </div>
-  )
-}
-
-// ── Pay modal ──
-function PayModal({ inst, policy, onClose, onPaid }) {
-  const supabase = createClient()
-  const [amount, setAmount] = useState(inst.paid_amount > 0 ? inst.paid_amount : (inst.amount_due || 0))
-  const [file, setFile] = useState(null)
-  const [saving, setSaving] = useState(false)
-
-  async function confirm() {
-    setSaving(true)
-    let uploadedPath = null
-
-    if (file) {
-      const fileExt = file.name.split('.').pop()
-      const fileName = `slip_${Date.now()}.${fileExt}`
-      const filePath = `${policy.id}/slips/${fileName}`
-      
-      const { data, error } = await supabase.storage.from('policy-docs').upload(filePath, file)
-      
-      if (error) {
-        alert("❌ อัปโหลดไฟล์รูปไม่สำเร็จ: " + error.message)
-        setSaving(false)
-        return 
-      }
-      if (data) uploadedPath = data.path
-    }
-
-    if (inst.isNewFullPayment) {
-      // ✅ กลับมาใช้ Insert ธรรมดา เพราะเคลียร์ข้อมูลเก่าที่มีปัญหาออกแล้ว
-      const { error: insertErr } = await supabase.from('installments').insert({
-        policy_id: policy.id,
-        user_id: policy.user_id, // ส่ง user_id ไปด้วย ไม่ให้ RLS บล็อกอีก
-        installment_no: 1,
-        total_inst: 1,
-        amount_due: parseFloat(inst.amount_due),
-        paid_amount: parseFloat(amount),
-        paid_at: new Date().toISOString(),
-        due_date: policy.policy_start,
-        slip_url: uploadedPath
-      })
-      
-      if (insertErr) {
-        alert("❌ บันทึกข้อมูลไม่สำเร็จ: " + insertErr.message)
-        setSaving(false)
-        return
-      }
-    } else {
-      const { error: updateErr } = await supabase.from('installments').update({
-        paid_at: inst.paid_at || new Date().toISOString(),
-        paid_amount: parseFloat(amount),
-        slip_url: uploadedPath || inst.slip_url
-      }).eq('id', inst.id)
-
-      if (updateErr) {
-        alert("❌ อัปเดตข้อมูลไม่สำเร็จ: " + updateErr.message)
-        setSaving(false)
-        return
-      }
-    }
-    
-    onPaid()
-  }
-
-  return (
-    <div className="mov" onClick={onClose}>
-      <div className="modal" onClick={e => e.stopPropagation()} style={{ maxWidth: 400 }}>
-        <div className="m-h">
-          <h2 className="m-t">
-            {inst.paid_amount > 0 ? `อัปเดตสลิป` : inst.isNewFullPayment ? 'รับชำระเต็มจำนวน' : `รับชำระงวด ${inst.installment_no}/${inst.total_inst}`}
-          </h2>
-          <button className="ib" style={{ marginLeft: 'auto' }} onClick={onClose}>{Icons.x}</button>
-        </div>
-        <div className="m-b" style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
-          <div className="field">
-            <label>ยอดชำระ (บาท)</label>
-            <input
-              className="input"
-              type="number"
-              value={amount}
-              onChange={e => setAmount(e.target.value)}
-              style={{ fontSize: 18, fontWeight: 700, textAlign: 'center' }}
-            />
-            <span className="hint">ยอดตามใบแจ้ง: {fmtB(inst.amount_due)}</span>
-          </div>
-          
-          <div className="field">
-            <label>{inst.paid_amount > 0 ? 'แนบสลิปโอนเงินย้อนหลัง' : 'แนบสลิปโอนเงิน (ตัวเลือก)'}</label>
-            <input 
-              type="file" 
-              accept="image/*" 
-              onChange={e => setFile(e.target.files[0])} 
-              className="input"
-              style={{ padding: '8px' }}
-            />
-          </div>
-
-          <div className="alert i">
-            {Icons.calendar}
-            <div>วันที่บันทึก: <b>{inst.paid_at ? new Date(inst.paid_at).toLocaleDateString('th-TH', { year: 'numeric', month: 'long', day: 'numeric' }) : new Date().toLocaleDateString('th-TH', { year: 'numeric', month: 'long', day: 'numeric' })}</b></div>
-          </div>
-        </div>
-        <div className="m-f">
-          <button className="btn sec" onClick={onClose}>ยกเลิก</button>
-          <button className="btn ok" onClick={confirm} disabled={saving}>
-            {saving ? 'กำลังบันทึก...' : `${Icons.check} ยืนยันข้อมูล`}
-          </button>
-        </div>
       </div>
     </div>
   )

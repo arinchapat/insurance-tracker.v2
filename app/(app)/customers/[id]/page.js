@@ -61,7 +61,7 @@ export default function CustomerDetailPage() {
     const [{ data: cust }, { data: pols }, { data: lg }] = await Promise.all([
       supabase.from('customers').select('*').eq('id', id).single(),
       supabase.from('policies')
-        .select('*, companies(name,color), agent_codes(code,label)')
+        .select('id, customer_id, company_id, agent_code, coverage_type, plate, model, premium, policy_start, policy_end, policy_status, notes, created_at, companies(name,color), agent_codes(code,label)')
         .eq('customer_id', id)
         .order('created_at', { ascending: false }),
       supabase.from('contact_logs')
@@ -190,7 +190,7 @@ export default function CustomerDetailPage() {
                     </td></tr>
                   ) : policies.map(p => (
                     <tr key={p.id} className="clk" onClick={() => router.push(`/policies/${p.id}`)}>
-                      <td><code style={{ color: '#1d4ed8', fontSize: 11.5 }}>{p.policy_number || p.id.slice(0,8)}</code></td>
+                      <td><code style={{ color: '#1d4ed8', fontSize: 11.5 }}>{(p.notes?.match(/\[policy_no:(.*?)\]/)?.[1]?.trim()) || p.id.slice(0,8)}</code></td>
                       <td><span className="badge b-bl">{p.coverage_type}</span></td>
                       <td>
                         <div style={{ fontSize: 12.5 }}>{p.companies?.name}</div>

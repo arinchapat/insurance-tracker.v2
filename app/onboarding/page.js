@@ -135,7 +135,7 @@ export default function OnboardingPage() {
         allow_credit_inst:   false,
         notify_before_due:   c.notify_before_due,
         alert_before_cancel: c.alert_before_cancel,
-        customer_cancel_after_days: c.customer_cancel_after_days,
+        customer_grace_days: c.customer_grace_days ?? c.customer_cancel_after_days ?? 5,
         user_id:             user.id,
       }))
     )
@@ -318,8 +318,8 @@ export default function OnboardingPage() {
                           <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:12 }}>
                             <div>
                               <label style={S.label}>ผ่อนผันรอลูกค้า</label>
-                              <select style={S.select} value={c.customer_cancel_after_days}
-                                onChange={e => setCode(gi, ci, 'customer_cancel_after_days', +e.target.value)}>
+                              <select style={S.select} value={c.customer_grace_days}
+                                onChange={e => setCode(gi, ci, 'customer_grace_days', +e.target.value)}>
                                 {[1,2,3,5,7,10].map(n => <option key={n} value={n}>{n} วัน</option>)}
                               </select>
                               <div style={S.hint}>หลังส่ง cancel warning รอลูกค้าอีกกี่วัน</div>

@@ -516,7 +516,7 @@ function AgentCodeModal({ initial, companies, onClose, onSaved }) {
     is_active:           initial?.is_active          ?? true,
     credit_days:          initial?.credit_days         ?? 30,
     cancel_after_days:          initial?.cancel_after_days         ?? 30,
-    customer_cancel_after_days: initial?.customer_cancel_after_days ?? 5,
+    customer_grace_days: initial?.customer_grace_days ?? 5,
     allow_credit_inst:   initial?.allow_credit_inst  ?? false,
     notify_before_due:   initial?.notify_before_due  ?? 7,
     alert_before_cancel: initial?.alert_before_cancel ?? 3,
@@ -532,7 +532,7 @@ function AgentCodeModal({ initial, companies, onClose, onSaved }) {
     const payload = {
       company_id: form.company_id, label: form.label, is_active: form.is_active,
       credit_days: form.credit_days, cancel_after_days: form.cancel_after_days,
-      customer_cancel_after_days: form.customer_cancel_after_days, allow_credit_inst: form.allow_credit_inst,
+      customer_grace_days: form.customer_grace_days, allow_credit_inst: form.allow_credit_inst,
       notify_before_due: form.notify_before_due, alert_before_cancel: form.alert_before_cancel,
       notes: form.notes,
     }
@@ -574,7 +574,7 @@ function AgentCodeModal({ initial, companies, onClose, onSaved }) {
         {/* หมวด 2 */}
         <SectionLabel label="หมวดที่ 2 · การบริหารลูกค้า (Customer Rules)" color="#7c3aed" />
         <Field label="ผ่อนผันรอลูกค้า (วัน)" hint="วันรอเงินหลังระบบยิง Standby Cancel แล้ว">
-          <input style={S.input} type="number" min="1" max="30" value={form.customer_cancel_after_days} onChange={e => set('customer_cancel_after_days', +e.target.value)} />
+          <input style={S.input} type="number" min="1" max="30" value={form.customer_grace_days} onChange={e => set('customer_grace_days', +e.target.value)} />
         </Field>
         <Field label="อนุญาต Credit Installment">
           <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginTop: 6 }}>

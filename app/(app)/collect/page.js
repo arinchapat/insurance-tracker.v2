@@ -4,7 +4,8 @@ import { useState, useEffect, useCallback } from 'react'
 import { useRouter } from 'next/navigation'
 import { createClient } from '@/lib/supabase/client'
 import { Icons, fmtB, fmtDate } from '@/components/ui/Icons'
-import { getInstallmentStatus } from '@/lib/domain/installment'
+import { getInstallmentStatus } from '@/lib/domains/installment/service'
+import PaymentForm from '@/components/domain/PaymentForm'
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Config
@@ -447,223 +448,17 @@ export default function CollectPage() {
       </div>
 
       {payModal && (
-        <PayModal group={payModal} onClose={() => setPayModal(null)} onPaid={() => { setPayModal(null); load() }} />
+        <PaymentForm
+          installment={payModal._nextInst}
+          policy={payModal._nextInst?.policies}
+          summary={{
+            totalPremium: payModal._totalPremium,
+            totalPaid:    payModal._totalPaid,
+          }}
+          onClose={() => setPayModal(null)}
+          onSaved={() => { setPayModal(null); load() }}
+        />
       )}
-    </div>
-  )
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Pay Modal — รับ group ทั้งก้อน เพื่อคำนวณยอดคงเหลือจริง + แนบสลิป
-// ─────────────────────────────────────────────────────────────────────────────
-function PayModal({ group, onClose, onPaid }) {
-  const supabase = createClient()
-  const inst = group._nextInst          // งวดที่จะจ่ายตอนนี้
-  const pol  = inst?.policies
-
-  // ── ใช้ค่าที่คำนวณไว้ใน groupByPolicy แล้ว ──────────────────────────────────
-  const totalPremium = group._totalPremium
-  const totalPaid    = group._totalPaid
-  const remaining    = Math.max(totalPremium - totalPaid, 0)
-  const isOverpaid   = group._allPaid && totalPaid >= totalPremium
-
-  const [amount, setAmount]   = useState(isOverpaid ? 0 : Math.min(Number(inst?.amount_due ?? 0), remaining))
-  const [slip, setSlip]       = useState(null)    // File object
-  const [slipPreview, setSlipPreview] = useState(null)
-  const [saving, setSaving]   = useState(false)
-  const [warning, setWarning] = useState('')
-
-  // ── ตรวจสอบ amount ทุกครั้งที่เปลี่ยน ─────────────────────────────────────
-  const handleAmountChange = val => {
-    setAmount(val)
-    const n = parseFloat(val) || 0
-    if (n > remaining) {
-      setWarning(`⚠️ ยอดนี้เกินที่ค้างอยู่ ${fmtB(remaining)} บาท — จะเกินชำระ ${fmtB(n - remaining)} บาท`)
-    } else if (n <= 0) {
-      setWarning('กรุณากรอกยอดชำระ')
-    } else {
-      setWarning('')
-    }
-  }
-
-  const handleSlip = e => {
-    const file = e.target.files?.[0]
-    if (!file) return
-    setSlip(file)
-    setSlipPreview(URL.createObjectURL(file))
-  }
-
-  async function confirm() {
-    if (!inst) return
-    setSaving(true)
-    let slipUrl = null
-
-    // ── อัปโหลด slip ถ้ามี ──────────────────────────────────────────────────
-    if (slip) {
-      const ext  = slip.name.split('.').pop()
-      const path = `slips/${inst.id}_${Date.now()}.${ext}`
-      const { data: uploadData } = await supabase.storage
-        .from('payment-slips')
-        .upload(path, slip, { upsert: true })
-      if (uploadData?.path) {
-        slipUrl = supabase.storage.from('payment-slips').getPublicUrl(uploadData.path).data.publicUrl
-      }
-    }
-
-    // ── บันทึก installment ──────────────────────────────────────────────────
-    await supabase.from('installments').update({
-      paid_at:     new Date().toISOString(),
-      paid_amount: parseFloat(amount),
-      ...(slipUrl ? { slip_url: slipUrl } : {}),
-    }).eq('id', inst.id)
-
-    onPaid()
-  }
-
-  if (!inst) return null
-
-  const amountNum    = parseFloat(amount) || 0
-  const afterPay     = totalPaid + amountNum
-  const percentAfter = Math.min((afterPay / totalPremium) * 100, 100)
-
-  return (
-    <div onClick={onClose} style={{ position:'fixed', inset:0, background:'rgba(0,0,0,.5)', zIndex:999, display:'flex', alignItems:'center', justifyContent:'center' }}>
-      <div onClick={e => e.stopPropagation()} style={{ background:'#fff', borderRadius:16, width:460, maxWidth:'94%', boxShadow:'0 25px 60px rgba(0,0,0,.25)', overflow:'hidden', maxHeight:'90vh', overflowY:'auto' }}>
-
-        {/* Header */}
-        <div style={{ padding:'20px 24px', borderBottom:'1px solid #f1f5f9', display:'flex', alignItems:'center', justifyContent:'space-between' }}>
-          <div>
-            <h2 style={{ fontSize:16, fontWeight:800, color:'#0f172a', margin:0 }}>
-              รับชำระงวด {inst.installment_no}/{inst.total_inst}
-            </h2>
-            <p style={{ fontSize:12, color:'#94a3b8', marginTop:3, marginBottom:0 }}>{pol?.id}</p>
-          </div>
-          <button onClick={onClose} style={{ width:32, height:32, borderRadius:8, border:'1px solid #e2e8f0', background:'#f8fafc', cursor:'pointer', fontSize:16, display:'flex', alignItems:'center', justifyContent:'center' }}>✕</button>
-        </div>
-
-        <div style={{ padding:'20px 24px', display:'flex', flexDirection:'column', gap:16 }}>
-
-          {/* Customer */}
-          <div style={{ background:'#f8fafc', borderRadius:10, padding:'12px 16px', display:'flex', gap:12, alignItems:'center' }}>
-            <div style={{ width:40, height:40, borderRadius:10, background:'#e0e7ff', display:'flex', alignItems:'center', justifyContent:'center', fontSize:18, flexShrink:0 }}>👤</div>
-            <div>
-              <div style={{ fontWeight:700, fontSize:14, color:'#0f172a' }}>{pol?.customers?.name}</div>
-              <div style={{ fontSize:12, color:'#64748b' }}>{pol?.customers?.phone}</div>
-            </div>
-          </div>
-
-          {/* Balance summary */}
-          <div style={{ background: isOverpaid ? '#fce7f3' : '#f0fdf4', borderRadius:10, padding:'14px 16px', border: `1px solid ${isOverpaid ? '#fbcfe8' : '#bbf7d0'}` }}>
-            <div style={{ fontSize:12, fontWeight:700, color: isOverpaid ? '#9d174d' : '#15803d', marginBottom:10 }}>
-              {isOverpaid ? '⚠️ ชำระเกินแล้ว — ไม่ต้องรับชำระเพิ่ม' : '📊 ยอดคงเหลือ'}
-            </div>
-            <div style={{ display:'grid', gridTemplateColumns:'repeat(3,1fr)', gap:10 }}>
-              {[
-                { label:'เบี้ยรวมทั้งหมด', val: fmtB(totalPremium), color:'#374151' },
-                { label:'ชำระแล้ว',         val: fmtB(totalPaid),    color:'#15803d' },
-                { label: isOverpaid ? 'เกินชำระ' : 'คงเหลือ',
-                  val: fmtB(Math.abs(remaining)),
-                  color: isOverpaid ? '#b91c1c' : '#1e40af' },
-              ].map(item => (
-                <div key={item.label} style={{ textAlign:'center' }}>
-                  <div style={{ fontSize:10, color:'#64748b', marginBottom:3 }}>{item.label}</div>
-                  <div style={{ fontSize:14, fontWeight:700, color: item.color, fontFamily:'monospace' }}>{item.val}</div>
-                </div>
-              ))}
-            </div>
-            {/* Progress bar */}
-            <div style={{ marginTop:12 }}>
-              <div style={{ height:6, background:'#e2e8f0', borderRadius:99, overflow:'hidden' }}>
-                <div style={{ height:'100%', width:`${Math.min((totalPaid / totalPremium) * 100, 100)}%`, background: isOverpaid ? '#ef4444' : '#22c55e', borderRadius:99 }} />
-              </div>
-              <div style={{ fontSize:11, color:'#94a3b8', marginTop:4, textAlign:'right' }}>
-                {Math.round((totalPaid / totalPremium) * 100)}% ชำระแล้ว
-              </div>
-            </div>
-          </div>
-
-          {/* Amount input */}
-          {!isOverpaid && (
-            <div>
-              <label style={{ fontSize:12, fontWeight:700, color:'#374151', display:'block', marginBottom:6 }}>
-                ยอดชำระ (บาท) <span style={{ color:'#94a3b8', fontWeight:400 }}>· คงเหลือ {fmtB(remaining)}</span>
-              </label>
-              <input
-                type="number"
-                value={amount}
-                onChange={e => handleAmountChange(e.target.value)}
-                style={{ width:'100%', fontSize:24, fontWeight:800, textAlign:'center', padding:'14px', borderRadius:10, border: `2px solid ${warning ? '#f59e0b' : '#2563eb'}`, outline:'none', color:'#0f172a', boxSizing:'border-box', fontFamily:'monospace' }}
-              />
-              <div style={{ fontSize:12, color:'#94a3b8', marginTop:5, textAlign:'center' }}>
-                ยอดตามใบแจ้ง: <b>{fmtB(inst.amount_due)}</b> บาท
-              </div>
-              {/* Overpayment / zero warning */}
-              {warning && (
-                <div style={{ marginTop:8, padding:'8px 12px', borderRadius:8, background:'#fef9c3', border:'1px solid #fde68a', fontSize:12, color:'#92400e', fontWeight:600 }}>
-                  {warning}
-                </div>
-              )}
-              {/* Preview: after paying */}
-              {amountNum > 0 && !warning && (
-                <div style={{ marginTop:8, padding:'8px 12px', borderRadius:8, background:'#eff6ff', border:'1px solid #bfdbfe', fontSize:12, color:'#1e40af' }}>
-                  หลังชำระ: จ่ายรวม <b>{fmtB(afterPay)}</b> / {fmtB(totalPremium)} บาท ({Math.round(percentAfter)}%)
-                </div>
-              )}
-            </div>
-          )}
-
-          {/* Date */}
-          <div style={{ background:'#eff6ff', borderRadius:8, padding:'10px 14px', fontSize:12, color:'#1e40af', display:'flex', gap:8, alignItems:'center' }}>
-            <span>📅</span>
-            <span>วันที่บันทึก: <b>{new Date().toLocaleDateString('th-TH', { year:'numeric', month:'long', day:'numeric' })}</b></span>
-          </div>
-
-          {/* Slip upload (optional) */}
-          <div>
-            <div style={{ fontSize:12, fontWeight:700, color:'#374151', marginBottom:8 }}>
-              แนบสลิป <span style={{ color:'#94a3b8', fontWeight:400 }}>(ไม่บังคับ)</span>
-            </div>
-            {slipPreview ? (
-              <div style={{ position:'relative', display:'inline-block' }}>
-                <img src={slipPreview} alt="slip" style={{ width:'100%', maxHeight:200, objectFit:'contain', borderRadius:8, border:'1px solid #e2e8f0' }} />
-                <button
-                  onClick={() => { setSlip(null); setSlipPreview(null) }}
-                  style={{ position:'absolute', top:6, right:6, width:24, height:24, borderRadius:'50%', background:'#ef4444', border:'none', color:'#fff', fontSize:12, cursor:'pointer', display:'flex', alignItems:'center', justifyContent:'center' }}
-                >✕</button>
-              </div>
-            ) : (
-              <label style={{ display:'flex', alignItems:'center', gap:10, padding:'12px 16px', borderRadius:10, border:'2px dashed #d1d5db', cursor:'pointer', background:'#f9fafb' }}>
-                <span style={{ fontSize:20 }}>📎</span>
-                <div>
-                  <div style={{ fontSize:13, fontWeight:600, color:'#374151' }}>เลือกรูปสลิป</div>
-                  <div style={{ fontSize:11, color:'#94a3b8' }}>JPG, PNG, PDF — ขนาดไม่เกิน 5MB</div>
-                </div>
-                <input type="file" accept="image/*,application/pdf" onChange={handleSlip} style={{ display:'none' }} />
-              </label>
-            )}
-          </div>
-        </div>
-
-        {/* Footer */}
-        <div style={{ padding:'0 24px 20px', display:'flex', gap:10 }}>
-          <button onClick={onClose} style={{ flex:1, padding:'12px', borderRadius:10, border:'1.5px solid #e2e8f0', background:'#fff', fontSize:13, fontWeight:600, color:'#374151', cursor:'pointer' }}>
-            ยกเลิก
-          </button>
-          {isOverpaid ? (
-            <button onClick={onClose} style={{ flex:2, padding:'12px', borderRadius:10, border:'none', background:'#f3f4f6', color:'#6b7280', fontSize:13, fontWeight:600, cursor:'default' }}>
-              ชำระครบแล้ว ไม่ต้องรับเพิ่ม
-            </button>
-          ) : (
-            <button
-              onClick={confirm}
-              disabled={saving || !!warning || amountNum <= 0}
-              style={{ flex:2, padding:'12px', borderRadius:10, border:'none', background: (saving || !!warning || amountNum <= 0) ? '#94a3b8' : '#0f172a', color:'#fff', fontSize:13, fontWeight:700, cursor: (saving || !!warning || amountNum <= 0) ? 'default' : 'pointer' }}
-            >
-              {saving ? 'กำลังบันทึก...' : `✓ ยืนยันรับชำระ ${fmtB(amountNum)} บาท`}
-            </button>
-          )}
-        </div>
-      </div>
     </div>
   )
 }

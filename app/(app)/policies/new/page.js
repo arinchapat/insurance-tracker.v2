@@ -462,8 +462,9 @@ export default function NewPolicyPage() {
           user_id: user.id,
           paid_at: isFirstInstPaid ? new Date().toISOString() : null,
           paid_amount: isFirstInstPaid ? parseFloat(payDetails.amount || amt) : null,
-          payment_channel: isFirstInstPaid ? payDetails.channel : null,
-          notes: isFirstInstPaid ? payDetails.notes : null,
+          notes: isFirstInstPaid
+            ? [payDetails.channel ? `[ch:${payDetails.channel}]` : '', payDetails.notes ?? ''].filter(Boolean).join('\n')
+            : null,
           slip_url: isFirstInstPaid ? uploadedSlipUrl : null,
         }
       })
@@ -475,8 +476,9 @@ export default function NewPolicyPage() {
         user_id: user.id,
         paid_at: isPaid ? new Date().toISOString() : null,
         paid_amount: isPaid ? parseFloat(form.premium) : null,
-        payment_channel: isPaid ? payDetails.channel : null,
-        notes: isPaid ? payDetails.notes : null,
+        notes: isPaid
+          ? [payDetails.channel ? `[ch:${payDetails.channel}]` : '', payDetails.notes ?? ''].filter(Boolean).join('\n')
+          : null,
         slip_url: isPaid ? uploadedSlipUrl : null,
       })
     }
